@@ -1,62 +1,86 @@
 # Open Myau
 
-![Preview](/images/image2.png)
-
 [Myau Client](https://myau.sell.app/), for those who can’t afford it.
 
 Based on **`Myau-260926`**, with added features and improvements not found in the original, focused on expanding and refining the original Myau client.
 
-[![Discord](https://invidget.switchblade.xyz/yjSaTufmqU)](https://discord.gg/yjSaTufmqU)
+[![Discord](https://invidget.switchblade.xyz/yjSaTufmqU)](https://discord.gg/zv2AwJT93s)
 
 ## Changes
 
-### Upstream sync — `250910` → `260926`
+### Upstream sync `250910` → `260926`
 
-Ported the upstream feature deltas released between those builds.
+Ported the feature deltas released upstream between these builds.
 
-**Rewritten modules**
+**KillAura**
+```
+[+] auto-block-no-slow, auto-block-hold, auto-block-delay, auto-block-hurt-time
+[+] Sort modes: DISTANCE, HEALTH, HURT_TIME, FOV
+[+] Millisecond-based auto-block timing
+[.] auto-block now defaults to LEGIT, mode list reordered
+[.] auto-block-range 6.0 → 4.0, swing-range 3.5 → 4.0
+[.] auto-block-require-press now defaults to true
+[.] Reworked rotation and release/swap teardown
+[-] auto-block-min-aps, auto-block-max-aps
+```
 
-* **KillAura** — millisecond-based auto-block timing, new `auto-block-no-slow`,
-  `auto-block-hold`, `auto-block-delay` and `auto-block-hurt-time` options, snapshotted
-  target selection with `DISTANCE` / `HEALTH` / `HURT_TIME` / `FOV` sorting, and a reworked
-  rotation and release/swap teardown. Auto-block CPS clamping was removed upstream.
-* **Scaffold** — placements are now re-verified with a confirming trace before being sent,
-  rotations snap to the mouse-sensitivity grid, and the telly takeoff, tower motion and
-  keep-y recovery paths were reworked.
-* **BedNuker** — `ground-spoof` now uses logical OR instead of AND, the render colour
-  channels were un-swapped, tool selection uses `findBestToolForBlock`, and packet
-  buffering moved onto `DelayManager`.
-* **AutoClicker** — the block-hit cycle is now driven by a hold duration, a release delay
-  and a hurt-time gate instead of a fixed tick count.
+**Scaffold**
+```
+[+] Placement re-verification via confirming trace
+[+] Rotation snapping to the mouse-sensitivity grid
+[.] Reworked telly takeoff, tower motion and keep-y recovery
+[.] Initial pitch now randomised between 65 and 85 degrees
+[-] no-keep-y-on-jump-potion
+```
 
-**New modules**
+**BedNuker**
+```
+[+] findBestToolForBlock for tool selection
+[+] 500ms bed scan cooldown
+[.] ground-spoof now uses OR instead of AND (bug fix)
+[.] Render colour channels un-swapped (bug fix)
+[.] Bed whitelist is now a single bed
+[.] Packet buffering moved onto DelayManager
+```
 
-* **Timer** — `VANILLA` and `HYPIXEL` modes.
+**AutoClicker**
+```
+[+] block-hit-hold, block-hit-delay, block-hit-hurt-time
+[.] Block-hit cycle driven by hold/delay/hurt-time instead of a fixed tick count
+[-] block-hit-ticks
+[-] range, hit-box-horizontal, hit-box-vertical
+```
 
-**Updated modules**
+**Timer** *(new module)*
+```
+[+] Timer with VANILLA and HYPIXEL modes
+```
 
-* **AimAssist** — added `require-press` and `allow-mining`, prefers the KillAura target,
-  and prioritises enemies.
-* **Eagle** — added `offset` and `align`.
-* **SpeedMine** — added `chance` and reworked around digging packets.
-* **WTap** — added `chance`.
-* **HitSelect** — added `shouldDelayAttack`, used by KillAura.
-* **NoSlow** — integrates with KillAura's `auto-block-no-slow`.
+**Other modules**
+```
+[+] AimAssist: require-press, allow-mining
+[+] Eagle: offset, align
+[+] SpeedMine: chance
+[+] WTap: chance
+[+] HitSelect: shouldDelayAttack, used by KillAura
+[.] AimAssist: prefers the KillAura target, prioritises enemies
+[.] SpeedMine: delay range 0-4 → 0-5, reworked around digging packets
+[.] NoSlow: integrates with KillAura's auto-block-no-slow
+[-] Eagle: jump-check, sneak-only
+```
 
 ### OpenMyau additions
 
-* Added Click GUI (ported from Raven B3 by blowsy)
-* Fixed bugs
+```
+[+] Click GUI (ported from Raven B3 by blowsy)
+[+] Fixed bugs
+```
 
-> **Note:** two upstream settings were removed by this sync and will be dropped from
-> existing configs — `auto-block-min-aps` / `auto-block-max-aps` (KillAura),
-> `block-hit-ticks` (AutoClicker, replaced by `block-hit-hold` / `block-hit-delay` /
-> `block-hit-hurt-time`), `jump-check` / `sneak-only` (Eagle), and
-> `no-keep-y-on-jump-potion` (Scaffold). The KillAura `auto-block` mode list was also
-> reordered and now defaults to `LEGIT`; saved configs are unaffected because modes are
-> stored by name.
+> **Config note:** settings marked `[-]` are dropped from existing configs on first load.
+> The KillAura `auto-block` mode list was also reordered — saved configs are unaffected,
+> because modes are stored by name rather than by index.
 
-If you encounter an issue or have a feature suggestion, please [create an issue](https://github.com/60124808866/OpenMyau/issues).
+If you encounter an issue or have a feature suggestion, please [create an issue](https://github.com/MekongRE/OpenMyau/issues).
 
 ## Building
 
@@ -70,4 +94,4 @@ You can open an issue or submit a pull request to help improve Open Myau.
 
 If you’re interested in co-developing or have questions, feel free to reach out:
 
-* Discord: `60124808866_88040`
+* Discord: `DocLamChohihi`
