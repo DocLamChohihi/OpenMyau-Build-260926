@@ -48,28 +48,46 @@ import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.ArrayList;
 import java.util.Locale;
-import java.util.Random;
+import java.util.Optional;
 
 public class KillAura extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
     private static final DecimalFormat df = new DecimalFormat("+0.0;-0.0", new DecimalFormatSymbols(Locale.US));
+    private static final long TICK_MILLIS = 50L;
+    private static final float TICK_MILLIS_FLOAT = 50.0F;
+    private static final int AUTO_BLOCK_NONE = 0;
+    private static final int AUTO_BLOCK_VANILLA = 1;
+    private static final int AUTO_BLOCK_HYPIXEL = 2;
+    private static final int AUTO_BLOCK_BLINK = 3;
+    private static final int AUTO_BLOCK_INTERACT = 4;
+    private static final int AUTO_BLOCK_SPOOF = 5;
+    private static final int AUTO_BLOCK_SWAP = 6;
+    private static final int AUTO_BLOCK_LEGIT = 7;
+    private static final int AUTO_BLOCK_FAKE = 8;
+
     private final TimerUtil timer = new TimerUtil();
-    private AttackData target = null;
+    private TargetSnapshot target = null;
+    private boolean hasTargetInAutoBlockRange = false;
     private int switchTick = 0;
     private boolean hitRegistered = false;
     private boolean blockingState = false;
-    private boolean isBlocking = false;
+    private boolean autoBlockActive = false;
     private boolean fakeBlockState = false;
-    private boolean blinkReset = false;
+    private boolean bufferRestartPending = false;
     private long attackDelayMS = 0L;
+    private long blockHoldMS = 0L;
+    private long blockReleaseDelayMS = 0L;
     private int blockTick = 0;
     private int lastTickProcessed;
+
     public final ModeProperty mode;
     public final ModeProperty sort;
     public final ModeProperty autoBlock;
     public final BooleanProperty autoBlockRequirePress;
-    public final FloatProperty autoBlockMinCPS;
-    public final FloatProperty autoBlockMaxCPS;
+    public final BooleanProperty autoBlockNoSlow;
+    public final FloatProperty autoBlockHold;
+    public final FloatProperty autoBlockDelay;
+    public final IntProperty autoBlockHurtTime;
     public final FloatProperty autoBlockRange;
     public final FloatProperty swingRange;
     public final FloatProperty attackRange;
@@ -98,37 +116,63 @@ public class KillAura extends Module {
     public final ModeProperty showTarget;
     public final ModeProperty debugLog;
 
-    private long getAttackDelay() {
-        return this.isBlocking ? (long) (1000.0F / RandomUtil.nextLong(this.autoBlockMinCPS.getValue().longValue(), this.autoBlockMaxCPS.getValue().longValue())) : 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
+    private long nextAttackDelayMillis() {
+        return 1000L / RandomUtil.nextLong(this.minCPS.getValue().longValue(), this.maxCPS.getValue().longValue());
     }
 
-    private boolean performAttack(float yaw, float pitch) {
-        if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-            if (this.isPlayerBlocking() && this.autoBlock.getValue() != 1) {
-                return false;
-            } else if (this.attackDelayMS > 0L) {
-                return false;
-            } else {
-                this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
-                mc.thePlayer.swingItem();
-                if ((this.rotations.getValue() != 0 || !this.isBoxInAttackRange(this.target.getBox()))
-                        && RotationUtil.rayTrace(this.target.getBox(), yaw, pitch, this.attackRange.getValue()) == null) {
-                    return false;
-                } else {
-                    AttackEvent event = new AttackEvent(this.target.getEntity());
-                    EventManager.call(event);
-                    ((IAccessorPlayerControllerMP) mc.playerController).callSyncCurrentPlayItem();
-                    PacketUtil.sendPacket(new C02PacketUseEntity(this.target.getEntity(), Action.ATTACK));
-                    if (mc.playerController.getCurrentGameType() != GameType.SPECTATOR) {
-                        PlayerUtil.attackEntity(this.target.getEntity());
-                    }
-                    this.hitRegistered = true;
-                    return true;
-                }
-            }
-        } else {
+    private long blockHoldDurationMillis() {
+        return (long) (this.autoBlockHold.getValue() * TICK_MILLIS_FLOAT);
+    }
+
+    private long blockReleaseDurationMillis() {
+        return (long) (this.autoBlockDelay.getValue() * TICK_MILLIS_FLOAT);
+    }
+
+    private boolean tryAttackTarget(float yaw, float pitch) {
+        if (Myau.packetActionTracker.sentDigging || Myau.packetActionTracker.sentBlockPlacement) {
             return false;
         }
+        if (this.isPlayerBlocking() && this.autoBlock.getValue() != AUTO_BLOCK_VANILLA) {
+            return false;
+        }
+        if (this.attackDelayMS > 0L) {
+            return false;
+        }
+        HitSelect hitSelect = (HitSelect) Myau.moduleManager.modules.get(HitSelect.class);
+        if (hitSelect.isEnabled() && hitSelect.shouldDelayAttack(this.target.getEntity())) {
+            return false;
+        }
+        this.attackDelayMS += this.nextAttackDelayMillis();
+        mc.thePlayer.swingItem();
+
+        boolean canAttack;
+        if (this.rotations.getValue() == 0) {
+            canAttack = this.isWithinAttackRange(this.target.getDistance());
+        } else {
+            Vec3 eyes = mc.thePlayer.getPositionEyes(1.0F);
+            if (this.throughWalls.getValue()) {
+                canAttack = RotationUtil.boundsRayTrace(
+                        this.target.getBox(), eyes, yaw, pitch, this.attackRange.getValue().doubleValue()
+                ) != null;
+            } else {
+                canAttack = !RotationUtil.isBoxRayObstructed(
+                        this.target.getBox(), eyes, yaw, pitch, this.attackRange.getValue().doubleValue()
+                );
+            }
+        }
+        if (!canAttack) {
+            return false;
+        }
+
+        AttackEvent event = new AttackEvent(this.target.getEntity());
+        EventManager.call(event);
+        ((IAccessorPlayerControllerMP) mc.playerController).callSyncCurrentPlayItem();
+        PacketUtil.sendPacket(new C02PacketUseEntity(this.target.getEntity(), Action.ATTACK));
+        if (mc.playerController.getCurrentGameType() != GameType.SPECTATOR) {
+            PlayerUtil.attackEntity(this.target.getEntity());
+        }
+        this.hitRegistered = true;
+        return true;
     }
 
     private void sendUseItem() {
@@ -149,33 +193,36 @@ public class KillAura extends Module {
     }
 
     private void interactAttack(float yaw, float pitch) {
-        if (this.target != null) {
-            MovingObjectPosition mop = RotationUtil.rayTrace(this.target.getBox(), yaw, pitch, 8.0);
-            if (mop != null) {
-                ((IAccessorPlayerControllerMP) mc.playerController).callSyncCurrentPlayItem();
-                PacketUtil.sendPacket(
-                        new C02PacketUseEntity(
-                                this.target.getEntity(),
-                                new Vec3(mop.hitVec.xCoord - this.target.getX(), mop.hitVec.yCoord - this.target.getY(), mop.hitVec.zCoord - this.target.getZ())
-                        )
-                );
-                PacketUtil.sendPacket(new C02PacketUseEntity(this.target.getEntity(), Action.INTERACT));
-                PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getHeldItem()));
-                mc.thePlayer.setItemInUse(mc.thePlayer.getHeldItem(), mc.thePlayer.getHeldItem().getMaxItemUseDuration());
-                this.blockingState = true;
-            }
+        if (this.target == null) {
+            return;
+        }
+        MovingObjectPosition mop = RotationUtil.boundsRayTrace(this.target.getBox(), yaw, pitch, 8.0);
+        if (mop != null) {
+            ((IAccessorPlayerControllerMP) mc.playerController).callSyncCurrentPlayItem();
+            PacketUtil.sendPacket(
+                    new C02PacketUseEntity(
+                            this.target.getEntity(),
+                            new Vec3(
+                                    mop.hitVec.xCoord - this.target.getX(),
+                                    mop.hitVec.yCoord - this.target.getY(),
+                                    mop.hitVec.zCoord - this.target.getZ()
+                            )
+                    )
+            );
+            PacketUtil.sendPacket(new C02PacketUseEntity(this.target.getEntity(), Action.INTERACT));
+            PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getHeldItem()));
+            mc.thePlayer.setItemInUse(mc.thePlayer.getHeldItem(), mc.thePlayer.getHeldItem().getMaxItemUseDuration());
+            this.blockingState = true;
         }
     }
 
-    private boolean canAttack() {
+    private boolean canRunCombat() {
         if (this.inventoryCheck.getValue() && mc.currentScreen instanceof GuiContainer) {
             return false;
         } else if (!(Boolean) this.weaponsOnly.getValue()
-                || ItemUtil.hasRawUnbreakingEnchant()
+                || ItemUtil.isHoldingWeapon()
                 || this.allowTools.getValue() && ItemUtil.isHoldingTool()) {
-            if (((IAccessorPlayerControllerMP) mc.playerController).getIsHittingBlock()) {
-                return false;
-            } else if ((ItemUtil.isEating() || ItemUtil.isUsingBow()) && PlayerUtil.isUsingItem()) {
+            if ((ItemUtil.isEating() || ItemUtil.isUsingBow()) && PlayerUtil.isUsingItem()) {
                 return false;
             } else {
                 AutoHeal autoHeal = (AutoHeal) Myau.moduleManager.modules.get(AutoHeal.class);
@@ -191,9 +238,11 @@ public class KillAura extends Module {
                     } else if (autoBlockIn.isEnabled()) {
                         return false;
                     } else if (this.requirePress.getValue()) {
-                        return PlayerUtil.isAttacking();
+                        return PlayerUtil.isAttackKeyDown();
                     } else {
-                        return !this.allowMining.getValue() || !mc.objectMouseOver.typeOfHit.equals(MovingObjectType.BLOCK) || !PlayerUtil.isAttacking();
+                        return !this.allowMining.getValue()
+                                || !mc.objectMouseOver.typeOfHit.equals(MovingObjectType.BLOCK)
+                                || !PlayerUtil.isAttackKeyDown();
                     }
                 }
             }
@@ -206,19 +255,17 @@ public class KillAura extends Module {
         if (!ItemUtil.isHoldingSword()) {
             return false;
         } else {
-            return !this.autoBlockRequirePress.getValue() || PlayerUtil.isUsingItem();
+            int autoBlockMode = this.autoBlock.getValue();
+            if (autoBlockMode == AUTO_BLOCK_NONE) {
+                return true;
+            } else if (autoBlockMode == AUTO_BLOCK_FAKE) {
+                return this.hasTargetInAutoBlockRange;
+            } else if (!this.autoBlockRequirePress.getValue() && this.hasTargetInAutoBlockRange) {
+                return true;
+            } else {
+                return PlayerUtil.isUseItemKeyDown();
+            }
         }
-    }
-
-    private boolean hasValidTarget() {
-        return mc.theWorld
-                .loadedEntityList
-                .stream()
-                .anyMatch(
-                        entity -> entity instanceof EntityLivingBase
-                                && this.isValidTarget((EntityLivingBase) entity)
-                                && this.isInBlockRange((EntityLivingBase) entity)
-                );
     }
 
     private boolean isValidTarget(EntityLivingBase entityLivingBase) {
@@ -227,68 +274,65 @@ public class KillAura extends Module {
         } else if (entityLivingBase != mc.thePlayer && entityLivingBase != mc.thePlayer.ridingEntity) {
             if (entityLivingBase == mc.getRenderViewEntity() || entityLivingBase == mc.getRenderViewEntity().ridingEntity) {
                 return false;
-            } else if (entityLivingBase.deathTime > 0) {
-                return false;
-            } else if (RotationUtil.angleToEntity(entityLivingBase) > this.fov.getValue().floatValue()) {
-                return false;
-            } else if (!this.throughWalls.getValue() && RotationUtil.rayTrace(entityLivingBase) != null) {
-                return false;
-            } else if (entityLivingBase instanceof EntityOtherPlayerMP) {
-                if (!this.players.getValue()) {
-                    return false;
-                } else if (TeamUtil.isFriend((EntityPlayer) entityLivingBase)) {
-                    return false;
-                } else {
-                    return (!this.teams.getValue() || !TeamUtil.isSameTeam((EntityPlayer) entityLivingBase)) && (!this.botCheck.getValue() || !TeamUtil.isBot((EntityPlayer) entityLivingBase));
-                }
-            } else if (entityLivingBase instanceof EntityDragon || entityLivingBase instanceof EntityWither) {
-                return this.bosses.getValue();
-            } else if (!(entityLivingBase instanceof EntityMob) && !(entityLivingBase instanceof EntitySlime)) {
-                if (entityLivingBase instanceof EntityAnimal
-                        || entityLivingBase instanceof EntityBat
-                        || entityLivingBase instanceof EntitySquid
-                        || entityLivingBase instanceof EntityVillager) {
-                    return this.animals.getValue();
-                } else if (!(entityLivingBase instanceof EntityIronGolem)) {
-                    return false;
-                } else {
-                    return this.golems.getValue() && (!this.teams.getValue() || !TeamUtil.hasTeamColor(entityLivingBase));
-                }
-            } else if (!(entityLivingBase instanceof EntitySilverfish)) {
-                return this.mobs.getValue();
             } else {
-                return this.silverfish.getValue() && (!this.teams.getValue() || !TeamUtil.hasTeamColor(entityLivingBase));
+                return this.passesEntityCategoryFilters(entityLivingBase);
             }
         } else {
             return false;
         }
     }
 
-    private boolean isInRange(EntityLivingBase entityLivingBase) {
-        return this.isInBlockRange(entityLivingBase) || this.isInSwingRange(entityLivingBase) || this.isInAttackRange(entityLivingBase);
+    private boolean passesEntityCategoryFilters(EntityLivingBase entityLivingBase) {
+        if (entityLivingBase.deathTime > 0) {
+            return false;
+        } else if (entityLivingBase instanceof EntityOtherPlayerMP) {
+            if (!this.players.getValue()) {
+                return false;
+            } else if (TeamUtil.isFriend((EntityPlayer) entityLivingBase)) {
+                return false;
+            } else {
+                return (!this.teams.getValue() || !TeamUtil.isSameTeam((EntityPlayer) entityLivingBase))
+                        && (!this.botCheck.getValue() || !TeamUtil.isBot((EntityPlayer) entityLivingBase));
+            }
+        } else if (entityLivingBase instanceof EntityDragon || entityLivingBase instanceof EntityWither) {
+            return this.bosses.getValue();
+        } else if (!(entityLivingBase instanceof EntityMob) && !(entityLivingBase instanceof EntitySlime)) {
+            if (entityLivingBase instanceof EntityAnimal
+                    || entityLivingBase instanceof EntityBat
+                    || entityLivingBase instanceof EntitySquid
+                    || entityLivingBase instanceof EntityVillager) {
+                return this.animals.getValue();
+            } else if (!(entityLivingBase instanceof EntityIronGolem)) {
+                return false;
+            } else {
+                return this.golems.getValue() && (!this.teams.getValue() || !TeamUtil.hasTeamColor(entityLivingBase));
+            }
+        } else if (!(entityLivingBase instanceof EntitySilverfish)) {
+            return this.mobs.getValue();
+        } else {
+            return this.silverfish.getValue() && (!this.teams.getValue() || !TeamUtil.hasTeamColor(entityLivingBase));
+        }
     }
 
-    private boolean isInBlockRange(EntityLivingBase entityLivingBase) {
-        return RotationUtil.distanceToEntity(entityLivingBase) <= (double) this.autoBlockRange.getValue();
+    private boolean isWithinAnyCombatRange(double distance) {
+        return this.isWithinAutoBlockRange(distance)
+                || this.isWithinSwingRange(distance)
+                || this.isWithinAttackRange(distance);
     }
 
-    private boolean isInSwingRange(EntityLivingBase entityLivingBase) {
-        return RotationUtil.distanceToEntity(entityLivingBase) <= (double) this.swingRange.getValue();
+    private boolean isWithinAutoBlockRange(double distance) {
+        return this.autoBlock.getValue() != AUTO_BLOCK_NONE && distance <= (double) this.autoBlockRange.getValue();
     }
 
-    private boolean isBoxInSwingRange(AxisAlignedBB axisAlignedBB) {
-        return RotationUtil.distanceToBox(axisAlignedBB) <= (double) this.swingRange.getValue();
+    private boolean isWithinSwingRange(double distance) {
+        return distance <= (double) this.swingRange.getValue();
     }
 
-    private boolean isInAttackRange(EntityLivingBase entityLivingBase) {
-        return RotationUtil.distanceToEntity(entityLivingBase) <= (double) this.attackRange.getValue();
+    private boolean isWithinAttackRange(double distance) {
+        return distance <= (double) this.attackRange.getValue();
     }
 
-    private boolean isBoxInAttackRange(AxisAlignedBB axisAlignedBB) {
-        return RotationUtil.distanceToBox(axisAlignedBB) <= (double) this.attackRange.getValue();
-    }
-
-    private boolean isPlayerTarget(EntityLivingBase entityLivingBase) {
+    private boolean isEnemyPlayer(EntityLivingBase entityLivingBase) {
         return entityLivingBase instanceof EntityPlayer && TeamUtil.isTarget((EntityPlayer) entityLivingBase);
     }
 
@@ -327,13 +371,15 @@ public class KillAura extends Module {
         this.mode = new ModeProperty("mode", 0, new String[]{"SINGLE", "SWITCH"});
         this.sort = new ModeProperty("sort", 0, new String[]{"DISTANCE", "HEALTH", "HURT_TIME", "FOV"});
         this.autoBlock = new ModeProperty(
-                "auto-block", 2, new String[]{"NONE", "VANILLA", "SPOOF", "HYPIXEL", "BLINK", "INTERACT", "SWAP", "LEGIT", "FAKE"}
+                "auto-block", 7, new String[]{"NONE", "VANILLA", "HYPIXEL", "BLINK", "INTERACT", "SPOOF", "SWAP", "LEGIT", "FAKE"}
         );
-        this.autoBlockRequirePress = new BooleanProperty("auto-block-require-press", false);
-        this.autoBlockMinCPS = new FloatProperty("auto-block-min-aps", 8.0F, 1.0F, 20.0F);
-        this.autoBlockMaxCPS = new FloatProperty("auto-block-max-aps", 10.0F, 1.0F, 20.0F);
-        this.autoBlockRange = new FloatProperty("auto-block-range", 6.0F, 3.0F, 8.0F);
-        this.swingRange = new FloatProperty("swing-range", 3.5F, 3.0F, 6.0F);
+        this.autoBlockRequirePress = new BooleanProperty("auto-block-require-press", true, this::isAutoBlockRequirePressVisible);
+        this.autoBlockNoSlow = new BooleanProperty("auto-block-no-slow", false, this::isAutoBlockNoSlowVisible);
+        this.autoBlockHold = new FloatProperty("auto-block-hold", 1.5F, 1.0F, 20.0F, this::isAutoBlockHoldVisible);
+        this.autoBlockDelay = new FloatProperty("auto-block-delay", 0.0F, 0.0F, 20.0F, this::isAutoBlockDelayVisible);
+        this.autoBlockHurtTime = new IntProperty("auto-block-hurt-time", 6, 0, 10, this::isAutoBlockHurtTimeVisible);
+        this.autoBlockRange = new FloatProperty("auto-block-range", 4.0F, 3.0F, 8.0F, this::isAutoBlockRangeVisible);
+        this.swingRange = new FloatProperty("swing-range", 4.0F, 3.0F, 6.0F);
         this.attackRange = new FloatProperty("attack-range", 3.0F, 3.0F, 6.0F);
         this.fov = new IntProperty("fov", 360, 30, 360);
         this.minCPS = new IntProperty("min-aps", 14, 1, 20);
@@ -366,25 +412,37 @@ public class KillAura extends Module {
     }
 
     public boolean isAttackAllowed() {
-        Scaffold scaffold = (Scaffold) Myau.moduleManager.modules.get(Scaffold.class);
-        if (scaffold.isEnabled()) {
+        if (this.inventoryCheck.getValue() && mc.currentScreen instanceof GuiContainer) {
             return false;
-        } else if (!this.weaponsOnly.getValue()
-                || ItemUtil.hasRawUnbreakingEnchant()
-                || this.allowTools.getValue() && ItemUtil.isHoldingTool()) {
-            return !this.requirePress.getValue() || KeyBindUtil.isKeyDown(mc.gameSettings.keyBindAttack.getKeyCode());
+        } else if (((IAccessorPlayerControllerMP) mc.playerController).getIsHittingBlock()) {
+            return false;
         } else {
-            return false;
+            Scaffold scaffold = (Scaffold) Myau.moduleManager.modules.get(Scaffold.class);
+            if (scaffold.isEnabled()) {
+                return false;
+            } else if (!(Boolean) this.weaponsOnly.getValue()
+                    || ItemUtil.isHoldingWeapon()
+                    || this.allowTools.getValue() && ItemUtil.isHoldingTool()) {
+                return !this.requirePress.getValue() || PlayerUtil.isAttackKeyDown();
+            } else {
+                return false;
+            }
         }
     }
 
+    public boolean isAutoBlockActive() {
+        return this.autoBlockActive;
+    }
+
+    /** Retained for {@link Velocity}: true while a non-fake auto-block is actively blocking. */
     public boolean shouldAutoBlock() {
-        if (this.isPlayerBlocking() && this.isBlocking) {
-            return !mc.thePlayer.isInWater() && !mc.thePlayer.isInLava() && (this.autoBlock.getValue() == 3  // HYPIXEL
-                    || this.autoBlock.getValue() == 4 // BLINK
-                    || this.autoBlock.getValue() == 5 // INTERACT
-                    || this.autoBlock.getValue() == 6 // SWAP
-                    || this.autoBlock.getValue() == 7); // LEGIT
+        if (this.isPlayerBlocking() && this.autoBlockActive) {
+            return !mc.thePlayer.isInWater() && !mc.thePlayer.isInLava() && (this.autoBlock.getValue() == AUTO_BLOCK_HYPIXEL
+                    || this.autoBlock.getValue() == AUTO_BLOCK_BLINK
+                    || this.autoBlock.getValue() == AUTO_BLOCK_INTERACT
+                    || this.autoBlock.getValue() == AUTO_BLOCK_SPOOF
+                    || this.autoBlock.getValue() == AUTO_BLOCK_SWAP
+                    || this.autoBlock.getValue() == AUTO_BLOCK_LEGIT);
         } else {
             return false;
         }
@@ -398,308 +456,338 @@ public class KillAura extends Module {
         return (mc.thePlayer.isUsingItem() || this.blockingState) && ItemUtil.isHoldingSword();
     }
 
+    private float[] calculateCombatRotation(float previousYaw, float previousPitch) {
+        float yawDelta = MathHelper.wrapAngleTo180_float(this.target.getYaw() - previousYaw);
+        float pitchDelta = this.target.getPitch() - previousPitch;
+        if (Math.abs(yawDelta) < 0.5F) {
+            yawDelta = 0.0F;
+        }
+        if (Math.abs(pitchDelta) < 0.5F) {
+            pitchDelta = 0.0F;
+        }
+        yawDelta = RotationUtil.clampAngle(yawDelta, (float) this.angleStep.getValue() * RandomUtil.nextFloat(0.75F, 1.0F));
+        pitchDelta = RotationUtil.clampAngle(pitchDelta, (float) this.angleStep.getValue() * RandomUtil.nextFloat(0.75F, 1.0F) * 0.5F);
+        yawDelta = RotationUtil.smoothAngle(yawDelta, (float) this.smoothing.getValue() / 100.0F + RandomUtil.nextFloat(-0.05F, 0.05F));
+        pitchDelta = RotationUtil.smoothAngle(pitchDelta, (float) this.smoothing.getValue() / 100.0F + RandomUtil.nextFloat(-0.05F, 0.05F));
+        float mouseStep = RotationUtil.mouseSensitivityIncrement();
+        if (yawDelta == 0.0F && pitchDelta != 0.0F) {
+            yawDelta += mouseStep * 0.15F * (RandomUtil.nextBoolean() ? 1.0F : -1.0F);
+        }
+        if (yawDelta != 0.0F && pitchDelta == 0.0F) {
+            pitchDelta += mouseStep * 0.15F * (RandomUtil.nextBoolean() ? 1.0F : -1.0F);
+        }
+        float yaw = RotationUtil.snapToMouseSensitivity(previousYaw + yawDelta, previousYaw);
+        float pitch = RotationUtil.snapToMouseSensitivity(previousPitch + pitchDelta, previousPitch);
+        return new float[]{yaw, MathHelper.clamp_float(pitch, -90.0F, 90.0F)};
+    }
+
     @EventTarget(Priority.LOW)
     public void onUpdate(UpdateEvent event) {
-        if (event.getType() == EventType.POST && this.blinkReset) {
-            this.blinkReset = false;
+        if (event.getType() == EventType.POST && this.bufferRestartPending) {
+            this.bufferRestartPending = false;
             Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
             Myau.blinkManager.setBlinkState(true, BlinkModules.AUTO_BLOCK);
         }
         if (this.isEnabled() && event.getType() == EventType.PRE) {
+            int controllerSlot = ((IAccessorPlayerControllerMP) mc.playerController).getCurrentPlayerItem();
+            boolean combatEligible = this.target != null && this.canRunCombat();
+            boolean canAttackThisTick = combatEligible;
+            boolean canBlockThisTick = combatEligible && this.canAutoBlock();
+            int autoBlockMode = this.autoBlock.getValue();
+            boolean blockSuppressed = autoBlockMode != AUTO_BLOCK_NONE
+                    && autoBlockMode != AUTO_BLOCK_FAKE
+                    && canBlockThisTick
+                    && (Myau.hurtTimeTracker.remainingHurtTicks() > this.autoBlockHurtTime.getValue()
+                    || this.blockReleaseDelayMS > 0L);
+
             if (this.attackDelayMS > 0L) {
-                this.attackDelayMS -= 50L;
+                this.attackDelayMS -= TICK_MILLIS;
             }
-            boolean attack = this.target != null && this.canAttack();
-            boolean block = attack && this.canAutoBlock();
-            if (!block) {
+            if (this.blockHoldMS > 0L) {
+                this.blockHoldMS -= TICK_MILLIS;
+            }
+            if (this.blockReleaseDelayMS > 0L) {
+                this.blockReleaseDelayMS -= TICK_MILLIS;
+            }
+
+            // Keep the current blocking phase only while blocking is eligible and not suppressed.
+            if (!canBlockThisTick || blockSuppressed) {
+                if (this.autoBlockActive
+                        && this.isPlayerBlocking()
+                        && !Myau.packetActionTracker.sentDigging
+                        && !Myau.packetActionTracker.sentBlockPlacement) {
+                    if (autoBlockMode == AUTO_BLOCK_INTERACT || autoBlockMode == AUTO_BLOCK_SPOOF) {
+                        int swapSlot = this.findEmptySlot(controllerSlot);
+                        PacketUtil.sendPacket(new C09PacketHeldItemChange(swapSlot));
+                        ((IAccessorPlayerControllerMP) mc.playerController).setCurrentPlayerItem(swapSlot);
+                    } else {
+                        this.stopBlock();
+                    }
+                    canAttackThisTick = false;
+                }
                 Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                this.isBlocking = false;
+                this.autoBlockActive = false;
                 this.fakeBlockState = false;
+                if (this.blockHoldMS > 0L) {
+                    this.blockHoldMS = 0L;
+                }
                 this.blockTick = 0;
             }
-            if (attack) {
-                boolean swap = false;
-                boolean blocked = false;
-                if (block) {
-                    switch (this.autoBlock.getValue()) {
-                        case 0: // NONE
-                            if (PlayerUtil.isUsingItem()) {
-                                this.isBlocking = true;
-                                if (!this.isPlayerBlocking() && !Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    swap = true;
-                                }
-                            } else {
-                                this.isBlocking = false;
-                                if (this.isPlayerBlocking() && !Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    this.stopBlock();
-                                }
-                            }
-                            Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                            this.fakeBlockState = false;
-                            break;
-                        case 1: // VANILLA
-                            if (this.hasValidTarget()) {
-                                if (!this.isPlayerBlocking() && !Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    swap = true;
-                                }
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = true;
-                                this.fakeBlockState = false;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
-                            }
-                            break;
-                        case 2: // SPOOF
-                            if (this.hasValidTarget()) {
-                                int item = ((IAccessorPlayerControllerMP) mc.playerController).getCurrentPlayerItem();
-                                if (Myau.playerStateManager.digging
-                                        || Myau.playerStateManager.placing
-                                        || mc.thePlayer.inventory.currentItem != item
-                                        || this.isPlayerBlocking() && this.blockTick != 0
-                                        || this.attackDelayMS > 0L && this.attackDelayMS <= 50L) {
-                                    this.blockTick = 0;
-                                } else {
-                                    int slot = this.findEmptySlot(item);
-                                    PacketUtil.sendPacket(new C09PacketHeldItemChange(slot));
-                                    PacketUtil.sendPacket(new C09PacketHeldItemChange(item));
-                                    swap = true;
+
+            // The attack-eligibility flag above may be cleared by a release/swap packet,
+            // so only exit here when the initial combat gate failed.
+            if (!combatEligible) {
+                return;
+            }
+
+            if (blockSuppressed) {
+                canBlockThisTick = false;
+                this.autoBlockActive = true;
+                this.fakeBlockState = true;
+            }
+
+            boolean shouldStartBlocking = false;
+            if (canBlockThisTick) {
+                switch (autoBlockMode) {
+                    case AUTO_BLOCK_NONE:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = false;
+                        this.fakeBlockState = false;
+                        if (PlayerUtil.isUseItemKeyDown()
+                                && !this.isPlayerBlocking()
+                                && !Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement) {
+                            shouldStartBlocking = true;
+                        }
+                        break;
+                    case AUTO_BLOCK_VANILLA:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = false;
+                        if (!this.isPlayerBlocking()
+                                && !Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement) {
+                            shouldStartBlocking = true;
+                        }
+                        break;
+                    case AUTO_BLOCK_HYPIXEL:
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = true;
+                        if (!Myau.packetActionTracker.sentDigging && !Myau.packetActionTracker.sentBlockPlacement) {
+                            switch (this.blockTick) {
+                                case 0:
+                                    if (!this.isPlayerBlocking()) {
+                                        shouldStartBlocking = true;
+                                        this.blockHoldMS += this.blockHoldDurationMillis();
+                                    }
+                                    this.bufferRestartPending = true;
                                     this.blockTick = 1;
-                                }
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = true;
-                                this.fakeBlockState = false;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
-                            }
-                            break;
-                        case 3: // HYPIXEL
-                            if (this.hasValidTarget()) {
-                                if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    switch (this.blockTick) {
-                                        case 0:
-                                            if (!this.isPlayerBlocking()) {
-                                                swap = true;
-                                            }
-                                            blocked = true;
-                                            this.blockTick = 1;
-                                            break;
-                                        case 1:
-                                            if (this.isPlayerBlocking()) {
-                                                if(Myau.moduleManager.modules.get(NoSlow.class).isEnabled()){
-                                                    int randomSlot = new Random().nextInt(9);
-                                                    while (randomSlot == mc.thePlayer.inventory.currentItem) {
-                                                        randomSlot = new Random().nextInt(9);
-                                                    }
-                                                    PacketUtil.sendPacket(new C09PacketHeldItemChange(randomSlot));
-                                                    PacketUtil.sendPacket(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
-                                                }
-                                                this.stopBlock();
-                                                attack = false;
-                                            }
-                                            if (this.attackDelayMS <= 50L) {
-                                                this.blockTick = 0;
-                                            }
-                                            break;
-                                        default:
-                                            this.blockTick = 0;
-                                    }
-                                }
-                                this.isBlocking = true;
-                                this.fakeBlockState = true;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
-                            }
-                            break;
-                        case 4: // BLINK
-                            if (this.hasValidTarget()) {
-                                if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    switch (this.blockTick) {
-                                        case 0:
-                                            if (!this.isPlayerBlocking()) {
-                                                swap = true;
-                                            }
-                                            this.blinkReset = true;
-                                            this.blockTick = 1;
-                                            break;
-                                        case 1:
-                                            if (this.isPlayerBlocking()) {
-                                                this.stopBlock();
-                                                attack = false;
-                                            }
-                                            if (this.attackDelayMS <= 50L) {
-                                                this.blockTick = 0;
-                                            }
-                                            break;
-                                        default:
-                                            this.blockTick = 0;
-                                    }
-                                }
-                                this.isBlocking = true;
-                                this.fakeBlockState = true;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
-                            }
-                            break;
-                        case 5: // INTERACT
-                            if (this.hasValidTarget()) {
-                                int item = ((IAccessorPlayerControllerMP) mc.playerController).getCurrentPlayerItem();
-                                if (mc.thePlayer.inventory.currentItem == item && !Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    switch (this.blockTick) {
-                                        case 0:
-                                            if (!this.isPlayerBlocking()) {
-                                                swap = true;
-                                            }
-                                            this.blinkReset = true;
-                                            this.blockTick = 1;
-                                            break;
-                                        case 1:
-                                            if (this.isPlayerBlocking()) {
-                                                int slot = this.findEmptySlot(item);
-                                                PacketUtil.sendPacket(new C09PacketHeldItemChange(slot));
-                                                ((IAccessorPlayerControllerMP) mc.playerController).setCurrentPlayerItem(slot);
-                                                attack = false;
-                                            }
-                                            if (this.attackDelayMS <= 50L) {
-                                                this.blockTick = 0;
-                                            }
-                                            break;
-                                        default:
-                                            this.blockTick = 0;
-                                    }
-                                }
-                                this.isBlocking = true;
-                                this.fakeBlockState = true;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
-                            }
-                            break;
-                        case 6: // SWAP
-                            if (this.hasValidTarget()) {
-                                int item = ((IAccessorPlayerControllerMP) mc.playerController).getCurrentPlayerItem();
-                                if (mc.thePlayer.inventory.currentItem == item && !Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    switch (this.blockTick) {
-                                        case 0:
-                                            int slot = this.findSwordSlot(item);
-                                            if (slot != -1) {
-                                                if (!this.isPlayerBlocking()) {
-                                                    swap = true;
-                                                }
-                                                this.blockTick = 1;
-                                            }
-                                            break;
-                                        case 1:
-                                            int swordsSlot = this.findSwordSlot(item);
-                                            if (swordsSlot == -1) {
-                                                this.blockTick = 0;
-                                            } else if (!this.isPlayerBlocking()) {
-                                                swap = true;
-                                            } else if (this.attackDelayMS <= 50L) {
-                                                PacketUtil.sendPacket(new C09PacketHeldItemChange(swordsSlot));
-                                                ((IAccessorPlayerControllerMP) mc.playerController).setCurrentPlayerItem(swordsSlot);
-                                                this.startBlock(mc.thePlayer.inventory.getStackInSlot(swordsSlot));
-                                                attack = false;
-                                                this.blockTick = 0;
-                                            }
-                                            break;
-                                        default:
-                                            this.blockTick = 0;
-                                    }
-                                    Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                    this.isBlocking = true;
-                                    this.fakeBlockState = true;
                                     break;
-                                }
-                            }
-                            Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                            this.isBlocking = false;
-                            this.fakeBlockState = false;
-                            break;
-                        case 7: // LEGIT
-                            if (this.hasValidTarget()) {
-                                if (!Myau.playerStateManager.digging && !Myau.playerStateManager.placing) {
-                                    switch (this.blockTick) {
-                                        case 0:
-                                            if (!this.isPlayerBlocking()) {
-                                                swap = true;
+                                case 1:
+                                    if (this.blockHoldMS <= 0L) {
+                                        if (this.isPlayerBlocking()) {
+                                            if (Myau.moduleManager.modules.get(NoSlow.class).isEnabled()) {
+                                                java.util.Random random = new java.util.Random();
+                                                int randomSlot = random.nextInt(9);
+                                                while (randomSlot == mc.thePlayer.inventory.currentItem) {
+                                                    randomSlot = random.nextInt(9);
+                                                }
+                                                PacketUtil.sendPacket(new C09PacketHeldItemChange(randomSlot));
+                                                PacketUtil.sendPacket(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
                                             }
-                                            this.blockTick = 1;
-                                            break;
-                                        case 1:
-                                            if (this.isPlayerBlocking()) {
-                                                this.stopBlock();
-                                                attack = false;
-                                            }
-                                            if (this.attackDelayMS <= 50L) {
-                                                this.blockTick = 0;
-                                            }
-                                            break;
-                                        default:
-                                            this.blockTick = 0;
+                                            this.stopBlock();
+                                            canAttackThisTick = false;
+                                        }
+                                        this.blockReleaseDelayMS += this.blockReleaseDurationMillis();
+                                        this.blockTick = 0;
+                                    } else {
+                                        this.bufferRestartPending = true;
                                     }
-                                }
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = true;
-                                this.fakeBlockState = false;
-                            } else {
-                                Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                                this.isBlocking = false;
-                                this.fakeBlockState = false;
+                                    break;
+                                default:
+                                    this.blockTick = 0;
                             }
-                            break;
-                        case 8: // FAKE
-                            Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                            this.isBlocking = false;
-                            this.fakeBlockState = this.hasValidTarget();
-                            if (PlayerUtil.isUsingItem()
-                                    && !this.isPlayerBlocking()
-                                    && !Myau.playerStateManager.digging
-                                    && !Myau.playerStateManager.placing) {
-                                swap = true;
+                        }
+                        break;
+                    case AUTO_BLOCK_BLINK:
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = true;
+                        if (!Myau.packetActionTracker.sentDigging && !Myau.packetActionTracker.sentBlockPlacement) {
+                            switch (this.blockTick) {
+                                case 0:
+                                    if (!this.isPlayerBlocking()) {
+                                        shouldStartBlocking = true;
+                                        this.blockHoldMS += this.blockHoldDurationMillis();
+                                    }
+                                    this.bufferRestartPending = true;
+                                    this.blockTick = 1;
+                                    break;
+                                case 1:
+                                    if (this.isPlayerBlocking()) {
+                                        this.stopBlock();
+                                        canAttackThisTick = false;
+                                    }
+                                    if (this.blockHoldMS <= 0L) {
+                                        this.blockReleaseDelayMS += this.blockReleaseDurationMillis();
+                                        this.blockTick = 0;
+                                    }
+                                    break;
+                                default:
+                                    this.blockTick = 0;
                             }
-                    }
-                }
-                boolean attacked = false;
-                if (this.isBoxInSwingRange(this.target.getBox())) {
-                    if (this.rotations.getValue() == 2 || this.rotations.getValue() == 3) {
-                        float[] rotations = RotationUtil.getRotationsToBox(
-                                this.target.getBox(),
-                                event.getYaw(),
-                                event.getPitch(),
-                                (float) this.angleStep.getValue() + RandomUtil.nextFloat(-5.0F, 5.0F),
-                                (float) this.smoothing.getValue() / 100.0F
-                        );
-                        event.setRotation(rotations[0], rotations[1], 1);
-                        if (this.rotations.getValue() == 3) {
-                            Myau.rotationManager.setRotation(rotations[0], rotations[1], 1, true);
                         }
-                        if (this.moveFix.getValue() != 0 || this.rotations.getValue() == 3) {
-                            event.setPervRotation(rotations[0], 1);
+                        break;
+                    case AUTO_BLOCK_INTERACT:
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = true;
+                        if (mc.thePlayer.inventory.currentItem == controllerSlot
+                                && !Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement) {
+                            switch (this.blockTick) {
+                                case 0:
+                                    if (!this.isPlayerBlocking()) {
+                                        shouldStartBlocking = true;
+                                        this.blockHoldMS += this.blockHoldDurationMillis();
+                                    }
+                                    this.bufferRestartPending = true;
+                                    this.blockTick = 1;
+                                    break;
+                                case 1:
+                                    if (this.isPlayerBlocking()) {
+                                        int slot = this.findEmptySlot(controllerSlot);
+                                        PacketUtil.sendPacket(new C09PacketHeldItemChange(slot));
+                                        ((IAccessorPlayerControllerMP) mc.playerController).setCurrentPlayerItem(slot);
+                                        canAttackThisTick = false;
+                                    }
+                                    if (this.blockHoldMS <= 0L) {
+                                        this.blockReleaseDelayMS += this.blockReleaseDurationMillis();
+                                        this.blockTick = 0;
+                                    }
+                                    break;
+                                default:
+                                    this.blockTick = 0;
+                            }
                         }
+                        break;
+                    case AUTO_BLOCK_SPOOF:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = false;
+                        if (!Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement
+                                && mc.thePlayer.inventory.currentItem == controllerSlot
+                                && (!this.isPlayerBlocking() || this.blockHoldMS <= 0L)) {
+                            int slot = this.findEmptySlot(controllerSlot);
+                            PacketUtil.sendPacket(new C09PacketHeldItemChange(slot));
+                            PacketUtil.sendPacket(new C09PacketHeldItemChange(controllerSlot));
+                            shouldStartBlocking = true;
+                            this.blockHoldMS += this.blockHoldDurationMillis();
+                        }
+                        break;
+                    case AUTO_BLOCK_SWAP:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = true;
+                        if (mc.thePlayer.inventory.currentItem == controllerSlot
+                                && !Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement) {
+                            switch (this.blockTick) {
+                                case 0:
+                                    if (!this.isPlayerBlocking()) {
+                                        shouldStartBlocking = true;
+                                        this.blockHoldMS += this.blockHoldDurationMillis();
+                                    }
+                                    this.blockTick = 1;
+                                    break;
+                                case 1:
+                                    if (this.blockHoldMS <= 0L) {
+                                        if (this.isPlayerBlocking()) {
+                                            int swordSlot = this.findSwordSlot(controllerSlot);
+                                            if (swordSlot != -1) {
+                                                PacketUtil.sendPacket(new C09PacketHeldItemChange(swordSlot));
+                                                ((IAccessorPlayerControllerMP) mc.playerController).setCurrentPlayerItem(swordSlot);
+                                                this.startBlock(mc.thePlayer.inventory.getStackInSlot(swordSlot));
+                                            } else {
+                                                this.stopBlock();
+                                            }
+                                            canAttackThisTick = false;
+                                        }
+                                        this.blockReleaseDelayMS += this.blockReleaseDurationMillis();
+                                        this.blockTick = 0;
+                                    }
+                                    break;
+                                default:
+                                    this.blockTick = 0;
+                            }
+                        }
+                        break;
+                    case AUTO_BLOCK_LEGIT:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = true;
+                        this.fakeBlockState = true;
+                        if (!Myau.packetActionTracker.sentDigging && !Myau.packetActionTracker.sentBlockPlacement) {
+                            switch (this.blockTick) {
+                                case 0:
+                                    if (!this.isPlayerBlocking()) {
+                                        shouldStartBlocking = true;
+                                        this.blockHoldMS += this.blockHoldDurationMillis();
+                                    }
+                                    this.blockTick = 1;
+                                    break;
+                                case 1:
+                                    if (this.blockHoldMS <= 0L) {
+                                        if (this.isPlayerBlocking()) {
+                                            this.stopBlock();
+                                            canAttackThisTick = false;
+                                        }
+                                        this.blockReleaseDelayMS += this.blockReleaseDurationMillis();
+                                        this.blockTick = 0;
+                                    }
+                                    break;
+                                default:
+                                    this.blockTick = 0;
+                            }
+                        }
+                        break;
+                    case AUTO_BLOCK_FAKE:
+                        Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+                        this.autoBlockActive = false;
+                        this.fakeBlockState = true;
+                        if (PlayerUtil.isUseItemKeyDown()
+                                && !this.isPlayerBlocking()
+                                && !Myau.packetActionTracker.sentDigging
+                                && !Myau.packetActionTracker.sentBlockPlacement) {
+                            shouldStartBlocking = true;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            boolean attacked = false;
+            if (this.target.hasUsableAim() && this.isWithinSwingRange(this.target.getDistance())) {
+                int rotationMode = this.rotations.getValue();
+                if (rotationMode == 2 || rotationMode == 3) {
+                    float[] rotation = this.calculateCombatRotation(event.getNewYaw(), event.getNewPitch());
+                    event.setRotation(rotation[0], rotation[1], 1);
+                    if (rotationMode == 3) {
+                        Myau.rotationManager.setRotation(rotation[0], rotation[1], 1, true);
                     }
-                    if (attack) {
-                        attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
+                    if (this.moveFix.getValue() != 0 || rotationMode == 3) {
+                        event.setPervRotation(rotation[0], 1);
                     }
                 }
-                if (swap) {
-                    if (attacked) {
-                        this.interactAttack(event.getNewYaw(), event.getNewPitch());
-                    } else {
-                        this.sendUseItem();
-                    }
+                if (canAttackThisTick) {
+                    attacked = this.tryAttackTarget(event.getNewYaw(), event.getNewPitch());
                 }
-                if (blocked) {
-                    Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
-                    Myau.blinkManager.setBlinkState(true, BlinkModules.AUTO_BLOCK);
+            }
+
+            if (shouldStartBlocking) {
+                if (attacked) {
+                    this.interactAttack(event.getNewYaw(), event.getNewPitch());
+                } else {
+                    this.sendUseItem();
                 }
             }
         }
@@ -710,73 +798,100 @@ public class KillAura extends Module {
         if (this.isEnabled()) {
             switch (event.getType()) {
                 case PRE:
-                    if (this.target == null
-                            || !this.isValidTarget(this.target.getEntity())
-                            || !this.isBoxInAttackRange(this.target.getBox())
-                            || !this.isBoxInSwingRange(this.target.getBox())
-                            || this.timer.hasTimeElapsed(this.switchDelay.getValue().longValue())) {
-                        this.timer.reset();
-                        ArrayList<EntityLivingBase> targets = new ArrayList<>();
-                        for (Entity entity : mc.theWorld.loadedEntityList) {
-                            if (entity instanceof EntityLivingBase
-                                    && this.isValidTarget((EntityLivingBase) entity)
-                                    && this.isInRange((EntityLivingBase) entity)) {
-                                targets.add((EntityLivingBase) entity);
-                            }
-                        }
-                        if (targets.isEmpty()) {
-                            this.target = null;
-                        } else {
-                            if (targets.stream().anyMatch(this::isInSwingRange)) {
-                                targets.removeIf(entityLivingBase -> !this.isInSwingRange(entityLivingBase));
-                            }
-                            if (targets.stream().anyMatch(this::isInAttackRange)) {
-                                targets.removeIf(entityLivingBase -> !this.isInAttackRange(entityLivingBase));
-                            }
-                            if (targets.stream().anyMatch(this::isPlayerTarget)) {
-                                targets.removeIf(entityLivingBase -> !this.isPlayerTarget(entityLivingBase));
-                            }
-                            targets.sort(
-                                    (entityLivingBase1, entityLivingBase2) -> {
-                                        int sortBase = 0;
-                                        switch (this.sort.getValue()) {
-                                            case 1:
-                                                sortBase = Float.compare(TeamUtil.getHealthScore(entityLivingBase1), TeamUtil.getHealthScore(entityLivingBase2));
-                                                break;
-                                            case 2:
-                                                sortBase = Integer.compare(entityLivingBase1.hurtResistantTime, entityLivingBase2.hurtResistantTime);
-                                                break;
-                                            case 3:
-                                                sortBase = Float.compare(
-                                                        RotationUtil.angleToEntity(entityLivingBase1),
-                                                        RotationUtil.angleToEntity(entityLivingBase2)
-                                                );
-                                        }
-                                        return sortBase != 0
-                                                ? sortBase
-                                                : Double.compare(RotationUtil.distanceToEntity(entityLivingBase1), RotationUtil.distanceToEntity(entityLivingBase2));
-                                    }
-                            );
-                            if (this.mode.getValue() == 1 && this.hitRegistered) {
-                                this.hitRegistered = false;
-                                this.switchTick++;
-                            }
-                            if (this.mode.getValue() == 0 || this.switchTick >= targets.size()) {
-                                this.switchTick = 0;
-                            }
-                            this.target = new AttackData(targets.get(this.switchTick));
+                    ArrayList<TargetSnapshot> candidates = this.collectTargetCandidates();
+                    if (candidates.isEmpty()) {
+                        this.target = null;
+                        this.hasTargetInAutoBlockRange = false;
+                        break;
+                    }
+                    this.hasTargetInAutoBlockRange = candidates.stream().anyMatch(this::isCandidateWithinAutoBlockRange);
+                    if (candidates.stream().anyMatch(TargetSnapshot::hasUsableAim)) {
+                        candidates.removeIf(snapshot -> !snapshot.hasUsableAim());
+                    }
+                    if (candidates.stream().anyMatch(this::isCandidateWithinSwingRange)) {
+                        candidates.removeIf(this::shouldDiscardOutsideSwingRange);
+                    }
+                    if (candidates.stream().anyMatch(this::isCandidateWithinAttackRange)) {
+                        candidates.removeIf(this::shouldDiscardOutsideAttackRange);
+                    }
+                    if (candidates.stream().anyMatch(this::isEnemyCandidate)) {
+                        candidates.removeIf(this::shouldDiscardNonEnemyCandidate);
+                    }
+                    if (candidates.isEmpty()) {
+                        this.target = null;
+                        break;
+                    }
+                    if (this.target != null && !this.timer.hasTimeElapsed(this.switchDelay.getValue().longValue())) {
+                        Optional<TargetSnapshot> existing = candidates.stream().filter(this::matchesCurrentTarget).findFirst();
+                        if (existing.isPresent()) {
+                            this.target = existing.get();
+                            break;
                         }
                     }
-                    if (this.target != null) {
-                        this.target = new AttackData(this.target.getEntity());
+                    candidates.sort(this::compareTargetCandidates);
+                    if (this.mode.getValue() == 1 && this.hitRegistered) {
+                        this.hitRegistered = false;
+                        this.switchTick++;
                     }
+                    if (this.mode.getValue() == 0 || this.switchTick >= candidates.size()) {
+                        this.switchTick = 0;
+                    }
+                    this.target = candidates.get(this.switchTick);
+                    this.timer.reset();
                     break;
                 case POST:
                     if (this.isPlayerBlocking() && !mc.thePlayer.isBlocking()) {
-                        mc.thePlayer.setItemInUse(mc.thePlayer.getHeldItem(), mc.thePlayer.getHeldItem().getMaxItemUseDuration());
+                        ItemStack heldItem = mc.thePlayer.getHeldItem();
+                        if (heldItem != null) {
+                            mc.thePlayer.setItemInUse(heldItem, heldItem.getMaxItemUseDuration());
+                        }
                     }
             }
         }
+    }
+
+    /** Collects valid combat targets in the same filter order used by target selection. */
+    private ArrayList<TargetSnapshot> collectTargetCandidates() {
+        Vec3 eyes = mc.thePlayer.getPositionEyes(1.0F);
+        ArrayList<TargetSnapshot> candidates = new ArrayList<>();
+        for (Entity entity : mc.theWorld.loadedEntityList) {
+            if (!(entity instanceof EntityLivingBase)) {
+                continue;
+            }
+            EntityLivingBase living = (EntityLivingBase) entity;
+            if (!this.isValidTarget(living)) {
+                continue;
+            }
+            double borderSize = living.getCollisionBorderSize();
+            AxisAlignedBB box = living.getEntityBoundingBox().expand(borderSize, borderSize, borderSize);
+            double distance = RotationUtil.clampVecToBox(box, eyes);
+            if (!this.isWithinAnyCombatRange(distance)) {
+                continue;
+            }
+            float angularDistance = RotationUtil.boxAimErrorFrom(box, eyes);
+            if (angularDistance > (float) this.fov.getValue()) {
+                continue;
+            }
+            float[] aim = RotationUtil.aimAtBox(box);
+            float yaw = aim[0];
+            float pitch = aim[1];
+            boolean hasUsableAim = true;
+            if (!this.throughWalls.getValue()
+                    && RotationUtil.isBoxRayObstructed(box, eyes, yaw, pitch, 8.0)) {
+                if (RotationUtil.isBoxRayObstructed(box, eyes, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, 8.0)) {
+                    hasUsableAim = false;
+                } else {
+                    yaw = mc.thePlayer.rotationYaw;
+                    pitch = mc.thePlayer.rotationPitch;
+                }
+            }
+            candidates.add(
+                    new TargetSnapshot(
+                            living, box, living.posX, living.posY, living.posZ, yaw, pitch, distance, angularDistance, hasUsableAim
+                    )
+            );
+        }
+        return candidates;
     }
 
     @EventTarget(Priority.LOWEST)
@@ -790,50 +905,42 @@ public class KillAura extends Module {
             }
             if (event.getPacket() instanceof C09PacketHeldItemChange) {
                 this.blockingState = false;
-                if (this.isBlocking) {
+                if (this.autoBlockActive) {
                     mc.thePlayer.stopUsingItem();
                 }
             }
             if (this.debugLog.getValue() == 1 && this.isAttackAllowed()) {
                 if (event.getPacket() instanceof S06PacketUpdateHealth) {
-                    float packet = ((S06PacketUpdateHealth) event.getPacket()).getHealth() - mc.thePlayer.getHealth();
-                    if (packet != 0.0F && this.lastTickProcessed != mc.thePlayer.ticksExisted) {
-                        this.lastTickProcessed = mc.thePlayer.ticksExisted;
-                        ChatUtil.sendFormatted(
-                                String.format(
-                                        "%sHealth: %s&l%s&r (&otick: %d&r)&r",
-                                        Myau.clientName,
-                                        packet > 0.0F ? "&a" : "&c",
-                                        df.format(packet),
-                                        mc.thePlayer.ticksExisted
-                                )
-                        );
-                    }
+                    this.logHealthDelta(((S06PacketUpdateHealth) event.getPacket()).getHealth() - mc.thePlayer.getHealth());
                 }
                 if (event.getPacket() instanceof S1CPacketEntityMetadata) {
                     S1CPacketEntityMetadata packet = (S1CPacketEntityMetadata) event.getPacket();
                     if (packet.getEntityId() == mc.thePlayer.getEntityId()) {
                         for (WatchableObject watchableObject : packet.func_149376_c()) {
                             if (watchableObject.getDataValueId() == 6) {
-                                float diff = (Float) watchableObject.getObject() - mc.thePlayer.getHealth();
-                                if (diff != 0.0F && this.lastTickProcessed != mc.thePlayer.ticksExisted) {
-                                    this.lastTickProcessed = mc.thePlayer.ticksExisted;
-                                    ChatUtil.sendFormatted(
-                                            String.format(
-                                                    "%sHealth: %s&l%s&r (&otick: %d&r)&r",
-                                                    Myau.clientName,
-                                                    diff > 0.0F ? "&a" : "&c",
-                                                    df.format(diff),
-                                                    mc.thePlayer.ticksExisted
-                                            )
-                                    );
-                                }
+                                this.logHealthDelta((Float) watchableObject.getObject() - mc.thePlayer.getHealth());
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    private void logHealthDelta(float delta) {
+        if (delta == 0.0F || this.lastTickProcessed == mc.thePlayer.ticksExisted) {
+            return;
+        }
+        this.lastTickProcessed = mc.thePlayer.ticksExisted;
+        ChatUtil.sendFormatted(
+                String.format(
+                        "%sHealth: %s&l%s&r (&otick: %d&r)&r",
+                        Myau.clientName,
+                        delta > 0.0F ? "&a" : "&c",
+                        df.format(delta),
+                        mc.thePlayer.ticksExisted
+                )
+        );
     }
 
     @EventTarget
@@ -846,15 +953,12 @@ public class KillAura extends Module {
                     && MoveUtil.isForwardPressed()) {
                 MoveUtil.fixStrafe(RotationState.getSmoothedYaw());
             }
-            if (this.shouldAutoBlock()) {
-                mc.thePlayer.movementInput.jump = false;
-            }
         }
     }
 
     @EventTarget
     public void onRender(Render3DEvent event) {
-        if (this.isEnabled() && target != null) {
+        if (this.isEnabled() && this.target != null) {
             if (this.showTarget.getValue() != 0
                     && TeamUtil.isEntityLoaded(this.target.getEntity())
                     && this.isAttackAllowed()) {
@@ -879,10 +983,13 @@ public class KillAura extends Module {
 
     @EventTarget
     public void onLeftClick(LeftClickMouseEvent event) {
-        if (this.isBlocking) {
+        if (this.autoBlockActive) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled()
+                    && this.target != null
+                    && this.canRunCombat()
+                    && this.isWithinSwingRange(this.target.getDistance())) {
                 event.setCancelled(true);
             }
         }
@@ -890,10 +997,13 @@ public class KillAura extends Module {
 
     @EventTarget
     public void onRightClick(RightClickMouseEvent event) {
-        if (this.isBlocking) {
+        if (this.autoBlockActive) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled()
+                    && this.target != null
+                    && this.canRunCombat()
+                    && this.isWithinSwingRange(this.target.getDistance())) {
                 event.setCancelled(true);
             }
         }
@@ -901,10 +1011,13 @@ public class KillAura extends Module {
 
     @EventTarget
     public void onHitBlock(HitBlockEvent event) {
-        if (this.isBlocking) {
+        if (this.autoBlockActive) {
             event.setCancelled(true);
         } else {
-            if (this.isEnabled() && this.target != null && this.canAttack()) {
+            if (this.isEnabled()
+                    && this.target != null
+                    && this.canRunCombat()
+                    && this.isWithinSwingRange(this.target.getDistance())) {
                 event.setCancelled(true);
             }
         }
@@ -912,7 +1025,7 @@ public class KillAura extends Module {
 
     @EventTarget
     public void onCancelUse(CancelUseEvent event) {
-        if (this.isBlocking) {
+        if (this.autoBlockActive) {
             event.setCancelled(true);
         }
     }
@@ -920,64 +1033,49 @@ public class KillAura extends Module {
     @Override
     public void onEnabled() {
         this.target = null;
+        this.hasTargetInAutoBlockRange = false;
         this.switchTick = 0;
         this.hitRegistered = false;
         this.attackDelayMS = 0L;
+        this.blockHoldMS = 0L;
+        this.blockReleaseDelayMS = 0L;
         this.blockTick = 0;
     }
 
     @Override
     public void onDisabled() {
         Myau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
+        if (this.blockingState) {
+            mc.thePlayer.stopUsingItem();
+        }
+        this.target = null;
+        this.hasTargetInAutoBlockRange = false;
+        this.bufferRestartPending = false;
         this.blockingState = false;
-        this.isBlocking = false;
+        this.autoBlockActive = false;
         this.fakeBlockState = false;
+        this.blockTick = 0;
+        this.blockHoldMS = 0L;
+        this.blockReleaseDelayMS = 0L;
     }
 
     @Override
     public void verifyValue(String value) {
-        boolean badCps = this.autoBlock.getValue() == 2
-                || this.autoBlock.getValue() == 3
-                || this.autoBlock.getValue() == 4
-                || this.autoBlock.getValue() == 5
-                || this.autoBlock.getValue() == 6
-                || this.autoBlock.getValue() == 7;
-        if (!this.autoBlock.getName().equals(value)) {
-            if (this.swingRange.getName().equals(value)) {
-                if (this.swingRange.getValue() < this.attackRange.getValue()) {
-                    this.attackRange.setValue(this.swingRange.getValue());
-                }
-            } else if (this.attackRange.getName().equals(value)) {
-                if (this.swingRange.getValue() < this.attackRange.getValue()) {
-                    this.swingRange.setValue(this.attackRange.getValue());
-                }
-            } else if (this.minCPS.getName().equals(value)) {
-                if (this.minCPS.getValue() > this.maxCPS.getValue()) {
-                    this.maxCPS.setValue(this.minCPS.getValue());
-                }
-            } else if (this.autoBlockMinCPS.getName().equals(value)) {
-                if (this.autoBlockMinCPS.getValue() > this.autoBlockMaxCPS.getValue()) {
-                    this.autoBlockMaxCPS.setValue(this.autoBlockMinCPS.getValue());
-                }
-                if(autoBlockMinCPS.getValue() > 10.0F && badCps){
-                    autoBlockMinCPS.setValue(10.0F);
-                }
-            } else if (this.autoBlockMaxCPS.getName().equals(value)) {
-                if (this.autoBlockMinCPS.getValue() > this.autoBlockMaxCPS.getValue()) {
-                    this.autoBlockMinCPS.setValue(this.autoBlockMaxCPS.getValue());
-                }
-                if(autoBlockMaxCPS.getValue() > 10.0F && badCps){
-                    autoBlockMaxCPS.setValue(10.0F);
-                }
-            } else {
-                if (this.maxCPS.getName().equals(value) && this.minCPS.getValue() > this.maxCPS.getValue()) {
-                    this.minCPS.setValue(this.maxCPS.getValue());
-                }
+        if (this.swingRange.getName().equals(value)) {
+            if (this.swingRange.getValue() < this.attackRange.getValue()) {
+                this.attackRange.setValue(this.swingRange.getValue());
             }
-        } else {
-            if (badCps && (this.autoBlockMinCPS.getValue() > 10.0F || this.autoBlockMaxCPS.getValue() > 10.0F)) {
-                this.autoBlockMinCPS.setValue(8.0F);
-                this.autoBlockMaxCPS.setValue(10.0F);
+        } else if (this.attackRange.getName().equals(value)) {
+            if (this.swingRange.getValue() < this.attackRange.getValue()) {
+                this.swingRange.setValue(this.attackRange.getValue());
+            }
+        } else if (this.minCPS.getName().equals(value)) {
+            if (this.minCPS.getValue() > this.maxCPS.getValue()) {
+                this.maxCPS.setValue(this.minCPS.getValue());
+            }
+        } else if (this.maxCPS.getName().equals(value)) {
+            if (this.minCPS.getValue() > this.maxCPS.getValue()) {
+                this.minCPS.setValue(this.maxCPS.getValue());
             }
         }
     }
@@ -987,20 +1085,117 @@ public class KillAura extends Module {
         return new String[]{CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, this.mode.getModeString())};
     }
 
-    public static class AttackData {
+    private int compareTargetCandidates(TargetSnapshot first, TargetSnapshot second) {
+        int sortBase;
+        switch (this.sort.getValue()) {
+            case 1:
+                sortBase = Float.compare(TeamUtil.getHealthScore(first.getEntity()), TeamUtil.getHealthScore(second.getEntity()));
+                break;
+            case 2:
+                sortBase = Integer.compare(first.getEntity().hurtResistantTime, second.getEntity().hurtResistantTime);
+                break;
+            case 3:
+                sortBase = Float.compare(first.getAngularDistance(), second.getAngularDistance());
+                break;
+            default:
+                sortBase = Double.compare(first.getDistance(), second.getDistance());
+        }
+        return sortBase != 0 ? sortBase : Double.compare(first.getDistance(), second.getDistance());
+    }
+
+    private boolean matchesCurrentTarget(TargetSnapshot candidate) {
+        return this.target != null && candidate.getEntity() == this.target.getEntity();
+    }
+
+    private boolean isEnemyCandidate(TargetSnapshot candidate) {
+        return this.isEnemyPlayer(candidate.getEntity());
+    }
+
+    private boolean shouldDiscardNonEnemyCandidate(TargetSnapshot candidate) {
+        return !this.isEnemyPlayer(candidate.getEntity());
+    }
+
+    private boolean isCandidateWithinSwingRange(TargetSnapshot candidate) {
+        return this.isWithinSwingRange(candidate.getDistance());
+    }
+
+    private boolean shouldDiscardOutsideSwingRange(TargetSnapshot candidate) {
+        return !this.isWithinSwingRange(candidate.getDistance());
+    }
+
+    private boolean isCandidateWithinAttackRange(TargetSnapshot candidate) {
+        return this.isWithinAttackRange(candidate.getDistance());
+    }
+
+    private boolean shouldDiscardOutsideAttackRange(TargetSnapshot candidate) {
+        return !this.isWithinAttackRange(candidate.getDistance());
+    }
+
+    private boolean isCandidateWithinAutoBlockRange(TargetSnapshot candidate) {
+        return this.isWithinAutoBlockRange(candidate.getDistance());
+    }
+
+    private boolean isAutoBlockRangeVisible() {
+        return this.autoBlock.getValue() != AUTO_BLOCK_NONE;
+    }
+
+    private boolean isAutoBlockHurtTimeVisible() {
+        int mode = this.autoBlock.getValue();
+        return mode != AUTO_BLOCK_NONE && mode != AUTO_BLOCK_FAKE;
+    }
+
+    private boolean isAutoBlockDelayVisible() {
+        int mode = this.autoBlock.getValue();
+        return mode != AUTO_BLOCK_NONE && mode != AUTO_BLOCK_VANILLA && mode != AUTO_BLOCK_FAKE;
+    }
+
+    private boolean isAutoBlockHoldVisible() {
+        int mode = this.autoBlock.getValue();
+        return mode != AUTO_BLOCK_NONE && mode != AUTO_BLOCK_FAKE;
+    }
+
+    private boolean isAutoBlockNoSlowVisible() {
+        return this.autoBlock.getValue() != AUTO_BLOCK_NONE;
+    }
+
+    private boolean isAutoBlockRequirePressVisible() {
+        return this.autoBlock.getValue() != AUTO_BLOCK_NONE;
+    }
+
+    private static class TargetSnapshot {
         private final EntityLivingBase entity;
         private final AxisAlignedBB box;
         private final double x;
         private final double y;
         private final double z;
+        private final float yaw;
+        private final float pitch;
+        private final double distance;
+        private final float angularDistance;
+        private final boolean hasUsableAim;
 
-        public AttackData(EntityLivingBase entityLivingBase) {
+        public TargetSnapshot(
+                EntityLivingBase entityLivingBase,
+                AxisAlignedBB axisAlignedBB,
+                double d,
+                double e,
+                double f,
+                float g,
+                float h,
+                double i,
+                float j,
+                boolean bl
+        ) {
             this.entity = entityLivingBase;
-            double collisionBorderSize = entityLivingBase.getCollisionBorderSize();
-            this.box = entityLivingBase.getEntityBoundingBox().expand(collisionBorderSize, collisionBorderSize, collisionBorderSize);
-            this.x = entityLivingBase.posX;
-            this.y = entityLivingBase.posY;
-            this.z = entityLivingBase.posZ;
+            this.box = axisAlignedBB;
+            this.x = d;
+            this.y = e;
+            this.z = f;
+            this.yaw = g;
+            this.pitch = h;
+            this.distance = i;
+            this.angularDistance = j;
+            this.hasUsableAim = bl;
         }
 
         public EntityLivingBase getEntity() {
@@ -1021,6 +1216,26 @@ public class KillAura extends Module {
 
         public double getZ() {
             return this.z;
+        }
+
+        public float getYaw() {
+            return this.yaw;
+        }
+
+        public float getPitch() {
+            return this.pitch;
+        }
+
+        public double getDistance() {
+            return this.distance;
+        }
+
+        public float getAngularDistance() {
+            return this.angularDistance;
+        }
+
+        public boolean hasUsableAim() {
+            return this.hasUsableAim;
         }
     }
 }

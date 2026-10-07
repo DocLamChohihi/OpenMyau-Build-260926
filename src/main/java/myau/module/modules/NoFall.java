@@ -35,6 +35,14 @@ public class NoFall extends Module {
         return this.scoreboardResetTimer.hasTimeElapsed(3000) && this.packetDelayTimer.hasTimeElapsed(this.delay.getValue().longValue());
     }
 
+    /**
+     * True while PACKET mode is actively holding the client at reduced timer speed.
+     * Timer reads this so the two modules do not fight over {@code timer.timerSpeed}.
+     */
+    public boolean isPacketModeActive() {
+        return this.slowFalling;
+    }
+
     public NoFall() {
         super("NoFall", false);
     }

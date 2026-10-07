@@ -128,9 +128,156 @@ public class RotationUtil {
     }
 
     public static MovingObjectPosition rayTrace(AxisAlignedBB boundingBox, float yaw, float pitch, double distance) {
+        return RotationUtil.boundsRayTrace(boundingBox, RotationUtil.mc.thePlayer.getPositionEyes(1.0f), yaw, pitch, distance);
+    }
+
+    // ------------------------------------------------------------------
+    // Ported from the Myau-250910 KillAura / AimAssist / Scaffold rewrite.
+    // The upstream build renamed these helpers; the math is unchanged.
+    // ------------------------------------------------------------------
+
+    /** Divide one whole mouse-sensitivity step for the current game setting. */
+    public static float mouseSensitivityIncrement() {
+        float sensitivity = RotationUtil.mc.gameSettings.mouseSensitivity * 0.6f + 0.2f;
+        return sensitivity * sensitivity * sensitivity * 8.0f;
+    }
+
+    /**
+     * Round an angle to the nearest whole mouse-sensitivity step measured from a
+     * reference angle. Mirrors the upstream {@code snapToMouseSensitivity}.
+     */
+    public static float snapToMouseSensitivity(float targetAngle, float referenceAngle) {
+        float change = MathHelper.wrapAngleTo180_float(targetAngle - referenceAngle);
+        float increment = RotationUtil.mouseSensitivityIncrement() * 0.15f;
+        if (increment == 0.0f) {
+            return targetAngle;
+        }
+        double roundedChange = Math.round(change / increment) * increment;
+        return referenceAngle + (float) roundedChange;
+    }
+
+    /** Convert a relative position into yaw and pitch without any smoothing. */
+    public static float[] rotationsFromDelta(double deltaX, double deltaY, double deltaZ) {
+        double horizontalDistance = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
+        float yaw = (float) (Math.atan2(deltaZ, deltaX) * 180.0 / Math.PI) - 90.0f;
+        float pitch = (float) (-Math.atan2(deltaY, horizontalDistance) * 180.0 / Math.PI);
+        return new float[]{yaw, pitch};
+    }
+
+    /** Center point of a bounding box. */
+    public static Vec3 boxCenter(AxisAlignedBB boundingBox) {
+        return new Vec3(
+                (boundingBox.minX + boundingBox.maxX) / 2.0,
+                (boundingBox.minY + boundingBox.maxY) / 2.0,
+                (boundingBox.minZ + boundingBox.maxZ) / 2.0
+        );
+    }
+
+    /** Distance from a position to the closest point of an entity's expanded box. */
+    public static double distanceToBoxFrom(Entity entity, Vec3 point) {
+        float borderSize = entity.getCollisionBorderSize();
+        AxisAlignedBB boundingBox = entity.getEntityBoundingBox().expand(borderSize, borderSize, borderSize);
+        return RotationUtil.clampVecToBox(boundingBox, point);
+    }
+
+    /**
+     * Aim between the box center and the closest point to the player, biased toward the
+     * closest point, then apply a vertical offset that grows as the player looks down.
+     */
+    public static float[] aimAtBox(AxisAlignedBB boundingBox) {
         Vec3 eyePos = RotationUtil.mc.thePlayer.getPositionEyes(1.0f);
-        Vec3 lookVec = ((IAccessorEntity) RotationUtil.mc.thePlayer).callGetVectorForRotation(pitch, yaw);
-        Vec3 targetPos = eyePos.addVector(lookVec.xCoord * distance, lookVec.yCoord * distance, lookVec.zCoord * distance);
-        return boundingBox.calculateIntercept(eyePos, targetPos);
+        Vec3 center = RotationUtil.boxCenter(boundingBox);
+        Vec3 closest = RotationUtil.clampVecToBox(eyePos, boundingBox);
+        double deltaX = center.xCoord + (closest.xCoord - center.xCoord) * 0.875 - eyePos.xCoord;
+        double deltaY = closest.yCoord - eyePos.yCoord;
+        double deltaZ = center.zCoord + (closest.zCoord - center.zCoord) * 0.875 - eyePos.zCoord;
+        float[] rotation = RotationUtil.rotationsFromDelta(deltaX, deltaY, deltaZ);
+        double height = center.yCoord - boundingBox.minY;
+        if (height != 0.0) {
+            rotation[1] = rotation[1] + 10.0f * MathHelper.clamp_float(
+                    (float) ((eyePos.yCoord - center.yCoord) / height), -0.5f, 0.5f);
+        }
+        return rotation;
+    }
+
+    /**
+     * Twice the larger yaw/pitch error between the current view and the box, or zero
+     * when the current sight line already intersects the box.
+     */
+    public static float boxAimError(AxisAlignedBB boundingBox) {
+        return RotationUtil.boxAimErrorFrom(boundingBox, RotationUtil.mc.thePlayer.getPositionEyes(1.0f));
+    }
+
+    public static float boxAimErrorFrom(AxisAlignedBB boundingBox, Vec3 eyePos) {
+        if (boundingBox.isVecInside(eyePos)) {
+            return 0.0f;
+        }
+        double traceDistance = 30.0
+                + (boundingBox.maxX - boundingBox.minX)
+                + (boundingBox.maxZ - boundingBox.minZ)
+                + (boundingBox.maxY - boundingBox.minY);
+        MovingObjectPosition hit = RotationUtil.boundsRayTrace(
+                boundingBox, eyePos, RotationUtil.mc.thePlayer.rotationYaw, RotationUtil.mc.thePlayer.rotationPitch, traceDistance);
+        if (hit != null) {
+            return 0.0f;
+        }
+        float[] rotation = RotationUtil.aimAtBox(boundingBox);
+        float yawError = Math.abs(MathHelper.wrapAngleTo180_float(rotation[0] - RotationUtil.mc.thePlayer.rotationYaw));
+        float pitchError = Math.abs(rotation[1] - RotationUtil.mc.thePlayer.rotationPitch);
+        return Math.max(yawError * 2.0f, pitchError * 2.0f);
+    }
+
+    /** Bounding-box aim error for an entity, including its collision border. */
+    public static float entityBoxAimError(Entity entity) {
+        float borderSize = entity.getCollisionBorderSize();
+        AxisAlignedBB boundingBox = entity.getEntityBoundingBox().expand(borderSize, borderSize, borderSize);
+        return RotationUtil.boxAimError(boundingBox);
+    }
+
+    /** Intersect a bounding box with a yaw/pitch ray cast from the player's eyes. */
+    public static MovingObjectPosition boundsRayTrace(AxisAlignedBB boundingBox, float yaw, float pitch, double distance) {
+        return RotationUtil.boundsRayTrace(boundingBox, RotationUtil.mc.thePlayer.getPositionEyes(1.0f), yaw, pitch, distance);
+    }
+
+    /** Intersect a bounding box with a yaw/pitch ray cast from an arbitrary position. */
+    public static MovingObjectPosition boundsRayTrace(AxisAlignedBB boundingBox, Vec3 position, float yaw, float pitch, double distance) {
+        Vec3 direction = ((IAccessorEntity) RotationUtil.mc.thePlayer).callGetVectorForRotation(pitch, yaw);
+        Vec3 end = position.addVector(direction.xCoord * distance, direction.yCoord * distance, direction.zCoord * distance);
+        return boundingBox.calculateIntercept(position, end);
+    }
+
+    /**
+     * True when a ray either misses the box outright or reaches a block before the box.
+     * Used by KillAura/AimAssist to reject aims that cannot actually see the target.
+     */
+    public static boolean isBoxRayObstructed(AxisAlignedBB boundingBox, Vec3 position, float yaw, float pitch, double distance) {
+        if (boundingBox.isVecInside(position)) {
+            return false;
+        }
+        MovingObjectPosition boxHit = RotationUtil.boundsRayTrace(boundingBox, position, yaw, pitch, distance);
+        if (boxHit == null) {
+            return true;
+        }
+        MovingObjectPosition blockHit = RotationUtil.rayTraceFrom(position, yaw, pitch, distance);
+        if (blockHit == null) {
+            return false;
+        }
+        return position.distanceTo(boxHit.hitVec) > position.distanceTo(blockHit.hitVec);
+    }
+
+    /** Trace blocks along a yaw/pitch ray from an arbitrary position. */
+    public static MovingObjectPosition rayTraceFrom(Vec3 position, float yaw, float pitch, double distance) {
+        Vec3 direction = ((IAccessorEntity) RotationUtil.mc.thePlayer).callGetVectorForRotation(pitch, yaw);
+        Vec3 end = position.addVector(direction.xCoord * distance, direction.yCoord * distance, direction.zCoord * distance);
+        return RotationUtil.mc.theWorld.rayTraceBlocks(position, end);
+    }
+
+    /** Trace blocks to the closest point on an entity. */
+    public static MovingObjectPosition rayTraceToEntity(Entity entity) {
+        Vec3 eyePos = RotationUtil.mc.thePlayer.getPositionEyes(1.0f);
+        float borderSize = entity.getCollisionBorderSize();
+        Vec3 targetPos = RotationUtil.clampVecToBox(
+                eyePos, entity.getEntityBoundingBox().expand(borderSize, borderSize, borderSize));
+        return RotationUtil.mc.theWorld.rayTraceBlocks(eyePos, targetPos);
     }
 }

@@ -9,6 +9,7 @@ import myau.events.PlayerUpdateEvent;
 import myau.events.UpdateEvent;
 import myau.management.RotationState;
 import myau.module.modules.AntiDebuff;
+import myau.module.modules.KillAura;
 import myau.module.modules.NoSlow;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.potion.Potion;
@@ -144,6 +145,12 @@ public abstract class MixinEntityPlayerSP extends MixinEntityPlayer {
             )
     )
     private boolean isUsing(EntityPlayerSP entityPlayerSP) {
+        // KillAura's auto-block-no-slow suppresses the item-use slowdown while it
+        // holds a block, mirroring the upstream redirect.
+        KillAura killAura = (KillAura) Myau.moduleManager.modules.get(KillAura.class);
+        if (killAura != null && killAura.isAutoBlockActive() && killAura.autoBlockNoSlow.getValue()) {
+            return false;
+        }
         NoSlow noSlow = (NoSlow) Myau.moduleManager.modules.get(NoSlow.class);
         return (!noSlow.isEnabled() || !noSlow.isAnyActive()) && entityPlayerSP.isUsingItem();
     }

@@ -382,6 +382,90 @@ public class ItemUtil {
         return ItemUtil.isBlock(ItemUtil.mc.thePlayer.getHeldItem());
     }
 
+    // ------------------------------------------------------------------
+    // Ported from the Myau-250910 rewrite (Scaffold / BedNuker / AimAssist).
+    // ------------------------------------------------------------------
+
+    /**
+     * True when the stack is a placement block that is safe to use for scaffolding:
+     * not right-click interactive and a full cube.
+     */
+    public static boolean isPlaceableBlockStack(ItemStack itemStack) {
+        return itemStack != null
+                && itemStack.stackSize >= 1
+                && itemStack.getItem() instanceof ItemBlock
+                && ItemUtil.isSuitablePlacementBlock((ItemBlock) itemStack.getItem());
+    }
+
+    /** True when the block item is neither interactable nor a non-full shape. */
+    public static boolean isSuitablePlacementBlock(ItemBlock itemBlock) {
+        Block block = itemBlock.getBlock();
+        return !BlockUtil.isInteractable(block) && BlockUtil.isSuitableFullBlock(block);
+    }
+
+    public static boolean isHoldingPlaceableBlock() {
+        return ItemUtil.isPlaceableBlockStack(ItemUtil.mc.thePlayer.getHeldItem());
+    }
+
+    /** Hotbar slot holding the item with the highest destroy speed against the block. */
+    public static int findBestToolForBlock(int preferredSlot, Block block) {
+        int bestSlot = preferredSlot;
+        ItemStack preferredStack = ItemUtil.mc.thePlayer.inventory.getStackInSlot(preferredSlot);
+        float bestStrength = preferredStack == null ? 1.0f : preferredStack.getStrVsBlock(block);
+        for (int slot = 0; slot < 9; ++slot) {
+            ItemStack candidate = ItemUtil.mc.thePlayer.inventory.getStackInSlot(slot);
+            if (candidate == null) {
+                continue;
+            }
+            float strength = candidate.getStrVsBlock(block);
+            if (strength > bestStrength) {
+                bestSlot = slot;
+                bestStrength = strength;
+            }
+        }
+        return bestSlot;
+    }
+
+    /**
+     * True when the held item counts as a weapon. Mirrors the upstream UHC/duel
+     * heuristics: swords, raw Unbreaking-tagged weapons, the emerald spade and the
+     * mace are all accepted.
+     */
+    public static boolean isHoldingWeapon() {
+        ItemStack heldItem = ItemUtil.mc.thePlayer.getHeldItem();
+        if (heldItem == null) {
+            return false;
+        }
+        if (heldItem.getItem() instanceof ItemSword) {
+            return true;
+        }
+        if (heldItem.hasTagCompound()) {
+            net.minecraft.nbt.NBTTagCompound tags = heldItem.getTagCompound();
+            if (tags.hasKey("ExtraAttributes")) {
+                net.minecraft.nbt.NBTTagCompound extra = tags.getCompoundTag("ExtraAttributes");
+                if (extra.hasKey("id")) {
+                    String id = extra.getString("id");
+                    if ("EMERALD_SPADE".equals(id) || "minecraft:mace".equals(id)) {
+                        return true;
+                    }
+                }
+            }
+            if (tags.hasKey("display")) {
+                net.minecraft.nbt.NBTTagCompound display = tags.getCompoundTag("display");
+                if (display.hasKey("Lore")) {
+                    net.minecraft.nbt.NBTTagList lore = display.getTagList("Lore", 8);
+                    for (int index = 0; index < lore.tagCount(); ++index) {
+                        String line = lore.getStringTagAt(index);
+                        if (line != null && line.contains("Sharpness XIX")) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return ItemUtil.hasRawUnbreakingEnchant();
+    }
+
     public static boolean hasHoldItem() {
         ItemStack itemStack = ItemUtil.mc.thePlayer.getHeldItem();
         if (itemStack == null || itemStack.stackSize < 1) {

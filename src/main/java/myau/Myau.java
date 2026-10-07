@@ -29,6 +29,8 @@ public class Myau {
     public static DelayManager delayManager;
     public static LagManager lagManager;
     public static PlayerStateManager playerStateManager;
+    public static PacketActionTracker packetActionTracker;
+    public static HurtTimeTracker hurtTimeTracker;
     public static FriendManager friendManager;
     public static TargetManager targetManager;
     public static PropertyManager propertyManager;
@@ -46,6 +48,8 @@ public class Myau {
         delayManager = new DelayManager();
         lagManager = new LagManager();
         playerStateManager = new PlayerStateManager();
+        packetActionTracker = new PacketActionTracker();
+        hurtTimeTracker = new HurtTimeTracker();
         friendManager = new FriendManager();
         targetManager = new TargetManager();
         propertyManager = new PropertyManager();
@@ -56,6 +60,8 @@ public class Myau {
         EventManager.register(blinkManager);
         EventManager.register(delayManager);
         EventManager.register(lagManager);
+        EventManager.register(packetActionTracker);
+        EventManager.register(hurtTimeTracker);
         EventManager.register(moduleManager);
         EventManager.register(commandManager);
         moduleManager.modules.put(AimAssist.class, new AimAssist());
@@ -120,6 +126,7 @@ public class Myau {
         moduleManager.modules.put(Sprint.class, new Sprint());
         moduleManager.modules.put(TargetHUD.class, new TargetHUD());
         moduleManager.modules.put(TargetStrafe.class, new TargetStrafe());
+        moduleManager.modules.put(Timer.class, new Timer());
         moduleManager.modules.put(Tracers.class, new Tracers());
         moduleManager.modules.put(Trajectories.class, new Trajectories());
         moduleManager.modules.put(Velocity.class, new Velocity());

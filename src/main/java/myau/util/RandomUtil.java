@@ -16,4 +16,9 @@ public class RandomUtil {
     public static double nextDouble(double min, double max) {
         return theRandom.nextDouble() * (max - min) + min;
     }
+
+    /** Random boolean from the shared generator, matching the upstream helper. */
+    public static boolean nextBoolean() {
+        return theRandom.nextBoolean();
+    }
 }

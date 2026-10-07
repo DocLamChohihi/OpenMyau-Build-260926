@@ -54,21 +54,22 @@ import java.util.concurrent.TimeUnit;
 
 public class BedNuker extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
+    private static final long BED_SCAN_COOLDOWN_MILLIS = 500L;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final TimerUtil timer = new TimerUtil();
-    private final ArrayList<BlockPos> bedWhitelist = new ArrayList<BlockPos>();
     private final Color colorRed = new Color(ChatColors.RED.toAwtColor());
     private final Color colorYellow = new Color(ChatColors.YELLOW.toAwtColor());
     private final Color colorGreen = new Color(ChatColors.GREEN.toAwtColor());
-    private BlockPos targetBed = null;
+    private BlockPos targetBlock = null;
+    private BlockPos whitelistedBed = null;
     private int breakStage = 0;
-    private int tickCounter = 0;
-    private float breakProgress = 0.0F;
-    private boolean isBed = false;
-    private int savedSlot = -1;
-    private boolean readyToBreak = false;
-    private boolean breaking = false;
-    private boolean waitingForStart = false;
+    private int breakTicks = 0;
+    private float accumulatedBreakDamage = 0.0F;
+    private boolean targetIsBed = false;
+    private int previousHotbarSlot = -1;
+    private boolean interactionLocked = false;
+    private boolean diggingInProgress = false;
+    private boolean awaitingSpawnTeleport = false;
     public final ModeProperty mode = new ModeProperty("mode", 0, new String[]{"LEGIT", "SWAP"});
     public final FloatProperty range = new FloatProperty("range", 4.5F, 3.0F, 6.0F);
     public final PercentProperty speed = new PercentProperty("speed", 0);
@@ -83,36 +84,36 @@ public class BedNuker extends Module {
     public final ModeProperty showProgress = new ModeProperty("show-progress", 1, new String[]{"NONE", "DEFAULT", "HUD"});
 
     private void resetBreaking() {
-        if (this.targetBed != null) {
-            mc.theWorld.sendBlockBreakProgress(mc.thePlayer.getEntityId(), this.targetBed, -1);
+        if (this.targetBlock != null) {
+            mc.theWorld.sendBlockBreakProgress(mc.thePlayer.getEntityId(), this.targetBlock, -1);
         }
-        this.targetBed = null;
+        this.targetBlock = null;
         this.breakStage = 0;
-        this.tickCounter = 0;
-        this.breakProgress = 0.0F;
-        this.isBed = false;
-        this.readyToBreak = false;
-        this.breaking = false;
+        this.breakTicks = 0;
+        this.accumulatedBreakDamage = 0.0F;
+        this.targetIsBed = false;
+        this.interactionLocked = false;
+        this.diggingInProgress = false;
     }
 
     private float calcProgress() {
-        if (this.targetBed == null) {
+        if (this.targetBlock == null) {
             return 0.0F;
         } else {
-            float progress = this.breakProgress;
+            float progress = this.accumulatedBreakDamage;
             if (this.groundSpeed.getValue()) {
-                int slot = ItemUtil.findInventorySlot(mc.thePlayer.inventory.currentItem, mc.theWorld.getBlockState(this.targetBed).getBlock());
-                progress = (float) this.tickCounter * this.getBreakDelta(mc.theWorld.getBlockState(this.targetBed), this.targetBed, slot, true);
+                int slot = ItemUtil.findBestToolForBlock(mc.thePlayer.inventory.currentItem, mc.theWorld.getBlockState(this.targetBlock).getBlock());
+                progress = (float) this.breakTicks * this.getBreakDelta(mc.theWorld.getBlockState(this.targetBlock), this.targetBlock, slot, true);
             }
             return Math.min(1.0F, progress / (1.0F - 0.3F * ((float) this.speed.getValue().intValue() / 100.0F)));
         }
     }
 
     private void restoreSlot() {
-        if (this.savedSlot != -1) {
-            mc.thePlayer.inventory.currentItem = this.savedSlot;
+        if (this.previousHotbarSlot != -1) {
+            mc.thePlayer.inventory.currentItem = this.previousHotbarSlot;
             this.syncHeldItem();
-            this.savedSlot = -1;
+            this.previousHotbarSlot = -1;
         }
     }
 
@@ -146,7 +147,7 @@ public class BedNuker extends Module {
         double x = (double) blockPos.getX() + 0.5 - mc.thePlayer.posX;
         double y = (double) blockPos.getY() + 0.25 - mc.thePlayer.posY - (double) mc.thePlayer.getEyeHeight();
         double z = (double) blockPos.getZ() + 0.5 - mc.thePlayer.posZ;
-        float[] rotations = RotationUtil.getRotationsTo(x, y, z, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch);
+        float[] rotations = RotationUtil.rotationsFromDelta(x, y, z);
         MovingObjectPosition mop = RotationUtil.rayTrace(rotations[0], rotations[1], 8.0, 1.0F);
         return mop == null ? EnumFacing.UP : mop.sideHit;
     }
@@ -205,7 +206,7 @@ public class BedNuker extends Module {
 
     private float calcBlockStrength(BlockPos blockPos) {
         IBlockState blockState = mc.theWorld.getBlockState(blockPos);
-        int slot = ItemUtil.findInventorySlot(mc.thePlayer.inventory.currentItem, blockState.getBlock());
+        int slot = ItemUtil.findBestToolForBlock(mc.thePlayer.inventory.currentItem, blockState.getBlock());
         return this.getBreakDelta(blockState, blockPos, slot, mc.thePlayer.onGround);
     }
 
@@ -219,6 +220,7 @@ public class BedNuker extends Module {
                 for (EnumFacing enumFacing : Arrays.asList(EnumFacing.UP, EnumFacing.NORTH, EnumFacing.EAST, EnumFacing.SOUTH, EnumFacing.WEST)) {
                     Block block = mc.theWorld.getBlockState(blockPos.offset(enumFacing)).getBlock();
                     if (BlockUtil.isReplaceable(block)) {
+                        // An exposed bed can be broken directly; no covering block is required.
                         return null;
                     }
                     if (!(block instanceof BlockBed)) {
@@ -257,12 +259,15 @@ public class BedNuker extends Module {
             for (int j = sY - 6; j <= sY + 6; j++) {
                 for (int k = sZ - 6; k <= sZ + 6; k++) {
                     BlockPos newPos = new BlockPos(i, j, k);
-                    if (!(Boolean) this.whiteList.getValue() || !this.bedWhitelist.contains(newPos)) {
-                        Block block = mc.theWorld.getBlockState(newPos).getBlock();
-                        if (block instanceof BlockBed
-                                && PlayerUtil.isBlockWithinReach(newPos, x, y, z, this.range.getValue().doubleValue())) {
-                            targets.add(newPos);
-                        }
+                    if ((Boolean) this.whiteList.getValue()
+                            && this.whitelistedBed != null
+                            && this.whitelistedBed.distanceSq(newPos) < 10.0) {
+                        continue;
+                    }
+                    Block block = mc.theWorld.getBlockState(newPos).getBlock();
+                    if (block instanceof BlockBed
+                            && PlayerUtil.isBlockWithinReach(newPos, x, y, z, this.range.getValue().doubleValue())) {
+                        targets.add(newPos);
                     }
                 }
             }
@@ -276,17 +281,17 @@ public class BedNuker extends Module {
                     )
             );
             for (BlockPos blockPos : targets) {
-                if (this.surroundings.getValue()) {
-                    BlockPos pos = this.validateBedPlacement(blockPos);
-                    if (pos != null) {
-                        Block block = mc.theWorld.getBlockState(pos).getBlock();
-                        if (this.toolCheck.getValue() && !this.hasProperTool(block)) {
-                            continue;
-                        }
-                        return pos;
-                    }
+                if (!this.surroundings.getValue()) {
+                    return blockPos;
                 }
-                return blockPos;
+                BlockPos pos = this.validateBedPlacement(blockPos);
+                if (pos == null) {
+                    return blockPos;
+                }
+                Block block = mc.theWorld.getBlockState(pos).getBlock();
+                if (!this.toolCheck.getValue() || this.hasProperTool(block)) {
+                    return pos;
+                }
             }
             return null;
         }
@@ -319,34 +324,46 @@ public class BedNuker extends Module {
         super("BedNuker", false);
     }
 
+    /**
+     * True while BedNuker owns the player's interaction, so other modules must back off.
+     * Kept as {@link #isReady()} for existing callers.
+     */
+    public boolean isControllingInteractions() {
+        return this.targetBlock != null && this.interactionLocked;
+    }
+
+    /** True while the target is actively being dug. Kept as {@link #isBreaking()} for existing callers. */
+    public boolean isDigging() {
+        return this.targetBlock != null && this.diggingInProgress;
+    }
+
     public boolean isReady() {
-        return this.targetBed != null && this.readyToBreak;
+        return this.isControllingInteractions();
     }
 
     public boolean isBreaking() {
-        return this.targetBed != null && this.breaking;
+        return this.isDigging();
     }
 
     @EventTarget(Priority.HIGH)
     public void onTick(TickEvent event) {
         if (this.isEnabled() && event.getType() == EventType.PRE) {
-            AutoBlockIn autoBlockIn = (AutoBlockIn) Myau.moduleManager.modules.get(AutoBlockIn.class);
-            if(autoBlockIn.isEnabled()) return;
-            if (this.targetBed != null) {
-                if (mc.theWorld.isAirBlock(this.targetBed) || !PlayerUtil.canReach(this.targetBed, this.range.getValue().doubleValue())) {
+            if (this.targetBlock != null) {
+                boolean invalidTarget = mc.theWorld.isAirBlock(this.targetBlock)
+                        || !PlayerUtil.canReach(this.targetBlock, this.range.getValue().doubleValue());
+                if (!invalidTarget && !this.targetIsBed) {
+                    BlockPos nearestBed = this.findNearestBed();
+                    invalidTarget = nearestBed != null && mc.theWorld.getBlockState(nearestBed).getBlock() instanceof BlockBed;
+                }
+                if (invalidTarget) {
                     this.restoreSlot();
                     this.resetBreaking();
-                } else if (!this.isBed) {
-                    BlockPos nearestBed = this.findNearestBed();
-                    if (nearestBed != null && mc.theWorld.getBlockState(nearestBed).getBlock() instanceof BlockBed) {
-                        this.resetBreaking();
-                    }
                 }
             }
-            if (this.targetBed != null) {
-                int slot = ItemUtil.findInventorySlot(mc.thePlayer.inventory.currentItem, mc.theWorld.getBlockState(this.targetBed).getBlock());
-                if (this.mode.getValue() == 0 && this.savedSlot == -1) {
-                    this.savedSlot = mc.thePlayer.inventory.currentItem;
+            if (this.targetBlock != null) {
+                int slot = ItemUtil.findBestToolForBlock(mc.thePlayer.inventory.currentItem, mc.theWorld.getBlockState(this.targetBlock).getBlock());
+                if (this.mode.getValue() == 0 && this.previousHotbarSlot == -1) {
+                    this.previousHotbarSlot = mc.thePlayer.inventory.currentItem;
                     mc.thePlayer.inventory.currentItem = slot;
                     this.syncHeldItem();
                 }
@@ -355,50 +372,50 @@ public class BedNuker extends Module {
                         if (!mc.thePlayer.isUsingItem()) {
                             this.doSwing();
                             PacketUtil.sendPacket(
-                                    new C07PacketPlayerDigging(Action.START_DESTROY_BLOCK, this.targetBed, this.getHitFacing(this.targetBed))
+                                    new C07PacketPlayerDigging(Action.START_DESTROY_BLOCK, this.targetBlock, this.getHitFacing(this.targetBlock))
                             );
                             this.doSwing();
-                            mc.effectRenderer.addBlockHitEffects(this.targetBed, this.getHitFacing(this.targetBed));
+                            mc.effectRenderer.addBlockHitEffects(this.targetBlock, this.getHitFacing(this.targetBlock));
                             this.breakStage = 1;
                         }
                         break;
                     case 1:
                         if (this.mode.getValue() == 1) {
-                            this.readyToBreak = false;
+                            this.interactionLocked = false;
                         }
-                        this.breaking = true;
-                        this.tickCounter++;
-                        this.breakProgress = this.breakProgress
-                                + this.getBreakDelta(mc.theWorld.getBlockState(this.targetBed), this.targetBed, slot, mc.thePlayer.onGround);
-                        float tick = (float) this.tickCounter;
-                        IBlockState blockState = mc.theWorld.getBlockState(this.targetBed);
-                        boolean canBreak = mc.thePlayer.onGround && this.groundSpeed.getValue();
-                        BlockPos target = this.targetBed;
-                        float delta = tick * this.getBreakDelta(blockState, target, slot, canBreak);
-                        mc.effectRenderer.addBlockHitEffects(this.targetBed, this.getHitFacing(this.targetBed));
-                        if (this.breakProgress >= 1.0F - 0.3F * ((float) this.speed.getValue().intValue() / 100.0F)
+                        this.diggingInProgress = true;
+                        this.breakTicks++;
+                        this.accumulatedBreakDamage = this.accumulatedBreakDamage
+                                + this.getBreakDelta(mc.theWorld.getBlockState(this.targetBlock), this.targetBlock, slot, mc.thePlayer.onGround);
+                        float tick = (float) this.breakTicks;
+                        IBlockState blockState = mc.theWorld.getBlockState(this.targetBlock);
+                        boolean effectiveGround = mc.thePlayer.onGround || this.groundSpeed.getValue();
+                        BlockPos target = this.targetBlock;
+                        float delta = tick * this.getBreakDelta(blockState, target, slot, effectiveGround);
+                        mc.effectRenderer.addBlockHitEffects(this.targetBlock, this.getHitFacing(this.targetBlock));
+                        if (this.accumulatedBreakDamage >= 1.0F - 0.3F * ((float) this.speed.getValue().intValue() / 100.0F)
                                 || delta >= 1.0F - 0.3F * ((float) this.speed.getValue().intValue() / 100.0F)) {
                             if (this.mode.getValue() == 1) {
-                                this.readyToBreak = true;
-                                this.savedSlot = mc.thePlayer.inventory.currentItem;
+                                this.interactionLocked = true;
+                                this.previousHotbarSlot = mc.thePlayer.inventory.currentItem;
                                 mc.thePlayer.inventory.currentItem = slot;
                                 this.syncHeldItem();
                                 if (mc.thePlayer.isUsingItem()) {
-                                    this.savedSlot = mc.thePlayer.inventory.currentItem;
+                                    this.previousHotbarSlot = mc.thePlayer.inventory.currentItem;
                                     mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
                                     this.syncHeldItem();
                                 }
                             }
-                            this.breaking = false;
+                            this.diggingInProgress = false;
                             PacketUtil.sendPacket(
-                                    new C07PacketPlayerDigging(Action.STOP_DESTROY_BLOCK, this.targetBed, this.getHitFacing(this.targetBed))
+                                    new C07PacketPlayerDigging(Action.STOP_DESTROY_BLOCK, this.targetBlock, this.getHitFacing(this.targetBlock))
                             );
                             this.doSwing();
-                            IBlockState blockState_ = mc.theWorld.getBlockState(this.targetBed);
+                            IBlockState blockState_ = mc.theWorld.getBlockState(this.targetBlock);
                             Block block = blockState_.getBlock();
                             if (block.getMaterial() != Material.air) {
-                                mc.theWorld.playAuxSFX(2001, this.targetBed, Block.getStateId(blockState_));
-                                mc.theWorld.setBlockToAir(this.targetBed);
+                                mc.theWorld.playAuxSFX(2001, this.targetBlock, Block.getStateId(blockState_));
+                                mc.theWorld.setBlockToAir(this.targetBlock);
                             }
                             if (block instanceof BlockBed) {
                                 this.timer.reset();
@@ -409,23 +426,26 @@ public class BedNuker extends Module {
                     case 2:
                         this.restoreSlot();
                         this.resetBreaking();
+                        break;
+                    default:
+                        this.resetBreaking();
                 }
-                if (this.targetBed != null) {
+                if (this.targetBlock != null) {
                     return;
                 }
             }
-            if (mc.thePlayer.capabilities.allowEdit && this.timer.hasTimeElapsed(500)) {
-                this.targetBed = this.findNearestBed();
+            if (mc.thePlayer.capabilities.allowEdit && this.timer.hasTimeElapsed(BED_SCAN_COOLDOWN_MILLIS)) {
+                this.targetBlock = this.findNearestBed();
                 this.breakStage = 0;
-                this.tickCounter = 0;
-                this.breakProgress = 0.0F;
-                this.isBed = this.targetBed != null && mc.theWorld.getBlockState(this.targetBed).getBlock() instanceof BlockBed;
+                this.breakTicks = 0;
+                this.accumulatedBreakDamage = 0.0F;
+                this.targetIsBed = this.targetBlock != null && mc.theWorld.getBlockState(this.targetBlock).getBlock() instanceof BlockBed;
                 this.restoreSlot();
-                if (this.targetBed != null) {
-                    this.readyToBreak = true;
+                if (this.targetBlock != null) {
+                    this.interactionLocked = true;
                 }
             }
-            if (this.targetBed == null) {
+            if (this.targetBlock == null) {
                 Myau.delayManager.setDelayState(false, DelayModules.BED_NUKER);
             }
         }
@@ -434,12 +454,10 @@ public class BedNuker extends Module {
     @EventTarget(Priority.LOWEST)
     public void onUpdate(UpdateEvent event) {
         if (this.isEnabled() && event.getType() == EventType.PRE) {
-            AutoBlockIn autoBlockIn = (AutoBlockIn) Myau.moduleManager.modules.get(AutoBlockIn.class);
-            if(autoBlockIn.isEnabled()) return;
-            if (this.isReady()) {
-                double x = (double) this.targetBed.getX() + 0.5 - mc.thePlayer.posX;
-                double y = (double) this.targetBed.getY() + 0.5 - mc.thePlayer.posY - (double) mc.thePlayer.getEyeHeight();
-                double z = (double) this.targetBed.getZ() + 0.5 - mc.thePlayer.posZ;
+            if (this.isControllingInteractions()) {
+                double x = (double) this.targetBlock.getX() + 0.5 - mc.thePlayer.posX;
+                double y = (double) this.targetBlock.getY() + 0.5 - mc.thePlayer.posY - (double) mc.thePlayer.getEyeHeight();
+                double z = (double) this.targetBlock.getZ() + 0.5 - mc.thePlayer.posZ;
                 float[] rotations = RotationUtil.getRotationsTo(x, y, z, event.getYaw(), event.getPitch());
                 event.setRotation(rotations[0], rotations[1], 5);
                 event.setPervRotation(this.moveFix.getValue() != 0 ? rotations[0] : mc.thePlayer.rotationYaw, 5);
@@ -450,7 +468,7 @@ public class BedNuker extends Module {
     @EventTarget
     public void onPlayerUpdate(PlayerUpdateEvent event) {
         if (this.isEnabled()) {
-            if (this.isBreaking()
+            if (this.isDigging()
                     && !Myau.playerStateManager.attacking
                     && !Myau.playerStateManager.digging
                     && !Myau.playerStateManager.placing
@@ -475,7 +493,7 @@ public class BedNuker extends Module {
     @EventTarget(Priority.HIGH)
     public void onKnockback(KnockbackEvent event) {
         if (this.isEnabled() && !event.isCancelled() && !(event.getY() <= 0.0)) {
-            if (this.ignoreVelocity.getValue() == 1 && this.targetBed != null) {
+            if (this.ignoreVelocity.getValue() == 1 && this.targetBlock != null) {
                 event.setCancelled(true);
                 event.setX(mc.thePlayer.motionX);
                 event.setY(mc.thePlayer.motionY);
@@ -487,7 +505,7 @@ public class BedNuker extends Module {
     @EventTarget
     public void onRender2D(Render2DEvent event) {
         if (this.isEnabled()) {
-            if (this.targetBed != null && (!this.isBed || !this.surroundings.getValue())) {
+            if (this.targetBlock != null && (!this.targetIsBed || !this.surroundings.getValue())) {
                 if (this.showProgress.getValue() != 0) {
                     HUD hud = (HUD) Myau.moduleManager.modules.get(HUD.class);
                     float scale = hud.scale.getValue();
@@ -516,18 +534,15 @@ public class BedNuker extends Module {
 
     @EventTarget(Priority.LOW)
     public void onRender3D(Render3DEvent event) {
-        if (this.isEnabled() && this.targetBed != null && !mc.theWorld.isAirBlock(this.targetBed)) {
-            mc.theWorld.sendBlockBreakProgress(mc.thePlayer.getEntityId(), this.targetBed, (int) (this.calcProgress() * 10.0F) - 1);
+        if (this.isEnabled() && this.targetBlock != null && !mc.theWorld.isAirBlock(this.targetBlock)) {
+            mc.theWorld.sendBlockBreakProgress(mc.thePlayer.getEntityId(), this.targetBlock, (int) (this.calcProgress() * 10.0F) - 1);
             if (this.showTarget.getValue() != 0) {
                 BedESP bedESP = (BedESP) Myau.moduleManager.modules.get(BedESP.class);
                 Color color = this.getProgressColor(this.showTarget.getValue());
                 RenderUtil.enableRenderState();
-                BlockPos target = this.targetBed;
-                double newHeight = this.isBed ? bedESP.getHeight() : 1.0;
-                int r = color.getRed();
-                int g = color.getBlue();
-                int b = color.getGreen();
-                RenderUtil.drawBlockBox(target, newHeight, r, b, g);
+                BlockPos target = this.targetBlock;
+                double newHeight = this.targetIsBed ? bedESP.getHeight() : 1.0;
+                RenderUtil.drawBlockBox(target, newHeight, color.getRed(), color.getGreen(), color.getBlue());
                 RenderUtil.disableRenderState();
             }
         }
@@ -535,7 +550,7 @@ public class BedNuker extends Module {
 
     @EventTarget
     public void onLoadWorld(LoadWorldEvent event) {
-        this.waitingForStart = false;
+        this.awaitingSpawnTeleport = false;
     }
 
     @EventTarget
@@ -543,31 +558,18 @@ public class BedNuker extends Module {
         if (!event.isCancelled()) {
             if (event.getPacket() instanceof S02PacketChat) {
                 String text = ((S02PacketChat) event.getPacket()).getChatComponent().getFormattedText();
-                if (text.contains("§e§lProtect your bed and destroy the enemy bed") || text.contains("§e§lDestroy the enemy bed and then eliminate them")) {
-                    this.waitingForStart = true;
+                if (text.contains("§e§lProtect your bed and destroy the enemy bed")
+                        || text.contains("§e§lDestroy the enemy bed and then eliminate them")
+                        || text.contains("§e§lEvery few seconds brings a new surprise")) {
+                    this.awaitingSpawnTeleport = true;
                 }
             }
-            if (event.getPacket() instanceof S08PacketPlayerPosLook && this.waitingForStart) {
-                this.waitingForStart = false;
-                this.bedWhitelist.clear();
-                this.scheduler.schedule(() -> {
-                    int sX = MathHelper.floor_double(mc.thePlayer.posX);
-                    int sY = MathHelper.floor_double(mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight());
-                    int sZ = MathHelper.floor_double(mc.thePlayer.posZ);
-                    for (int i = sX - 25; i <= sX + 25; i++) {
-                        for (int j = sY - 25; j <= sY + 25; j++) {
-                            for (int k = sZ - 25; k <= sZ + 25; k++) {
-                                BlockPos blockPos = new BlockPos(i, j, k);
-                                Block block = mc.theWorld.getBlockState(blockPos).getBlock();
-                                if (block instanceof BlockBed) {
-                                    this.bedWhitelist.add(blockPos);
-                                }
-                            }
-                        }
-                    }
-                }, 1L, TimeUnit.SECONDS);
+            if (event.getPacket() instanceof S08PacketPlayerPosLook && this.awaitingSpawnTeleport) {
+                this.awaitingSpawnTeleport = false;
+                this.whitelistedBed = null;
+                this.scheduler.schedule(this::scanNearbyBedForWhitelist, 1L, TimeUnit.SECONDS);
             }
-            if (this.isEnabled() && this.targetBed != null && this.ignoreVelocity.getValue() == 2 && Myau.delayManager.getDelayModule() != DelayModules.BED_NUKER) {
+            if (this.isEnabled() && this.targetBlock != null && this.ignoreVelocity.getValue() == 2 && Myau.delayManager.getDelayModule() != DelayModules.BED_NUKER) {
                 if (event.getPacket() instanceof S12PacketEntityVelocity) {
                     S12PacketEntityVelocity packet = (S12PacketEntityVelocity) event.getPacket();
                     if (packet.getEntityID() == mc.thePlayer.getEntityId() && packet.getMotionY() > 0) {
@@ -591,7 +593,9 @@ public class BedNuker extends Module {
     @EventTarget
     public void onLeftClick(LeftClickMouseEvent event) {
         if (this.isEnabled()) {
-            if (this.isReady() || this.targetBed != null && mc.objectMouseOver != null && mc.objectMouseOver.typeOfHit == MovingObjectType.BLOCK) {
+            if (this.isControllingInteractions()) {
+                event.setCancelled(true);
+            } else if (this.targetBlock != null && mc.objectMouseOver != null && mc.objectMouseOver.typeOfHit == MovingObjectType.BLOCK) {
                 event.setCancelled(true);
             }
         }
@@ -600,7 +604,7 @@ public class BedNuker extends Module {
     @EventTarget
     public void onRightClick(RightClickMouseEvent event) {
         if (this.isEnabled()) {
-            if (this.isReady()) {
+            if (this.isControllingInteractions()) {
                 event.setCancelled(true);
             }
         }
@@ -609,7 +613,9 @@ public class BedNuker extends Module {
     @EventTarget
     public void onHitBlock(HitBlockEvent event) {
         if (this.isEnabled()) {
-            if (this.isReady() || this.targetBed != null && mc.objectMouseOver != null && mc.objectMouseOver.typeOfHit == MovingObjectType.BLOCK) {
+            if (this.isControllingInteractions()) {
+                event.setCancelled(true);
+            } else if (this.targetBlock != null && mc.objectMouseOver != null && mc.objectMouseOver.typeOfHit == MovingObjectType.BLOCK) {
                 event.setCancelled(true);
             }
         }
@@ -618,7 +624,8 @@ public class BedNuker extends Module {
     @EventTarget
     public void onSwap(SwapItemEvent event) {
         if (this.isEnabled()) {
-            if (this.savedSlot != -1) {
+            if (this.previousHotbarSlot != -1) {
+                this.previousHotbarSlot = event.setSlot(this.previousHotbarSlot);
                 event.setCancelled(true);
             }
         }
@@ -627,12 +634,45 @@ public class BedNuker extends Module {
     @Override
     public void onDisabled() {
         this.resetBreaking();
-        this.savedSlot = -1;
+        this.previousHotbarSlot = -1;
         Myau.delayManager.setDelayState(false, DelayModules.BED_NUKER);
     }
 
     @Override
     public String[] getSuffix() {
         return new String[]{CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, this.mode.getModeString())};
+    }
+
+    /**
+     * Records the closest bed around the post-teleport spawn so the same base is not
+     * re-targeted once the player is thrown into the game.
+     */
+    private void scanNearbyBedForWhitelist() {
+        if (mc.thePlayer == null || mc.theWorld == null) {
+            return;
+        }
+        int sX = MathHelper.floor_double(mc.thePlayer.posX);
+        int sY = MathHelper.floor_double(mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight());
+        int sZ = MathHelper.floor_double(mc.thePlayer.posZ);
+        BlockPos closestBed = null;
+        int closestDistance = Integer.MAX_VALUE;
+        for (int i = sX - 25; i <= sX + 25; i++) {
+            for (int j = sY - 25; j <= sY + 25; j++) {
+                for (int k = sZ - 25; k <= sZ + 25; k++) {
+                    BlockPos blockPos = new BlockPos(i, j, k);
+                    if (!(mc.theWorld.getBlockState(blockPos).getBlock() instanceof BlockBed)) {
+                        continue;
+                    }
+                    int distance = Math.abs(i - sX) + Math.abs(j - sY) + Math.abs(k - sZ);
+                    if (distance < closestDistance) {
+                        closestBed = blockPos;
+                        closestDistance = distance;
+                    }
+                }
+            }
+        }
+        if (closestBed != null) {
+            this.whitelistedBed = closestBed;
+        }
     }
 }

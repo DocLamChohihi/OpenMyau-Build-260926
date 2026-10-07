@@ -8,6 +8,7 @@ import myau.events.PacketEvent;
 import myau.module.Module;
 import myau.util.TimerUtil;
 import myau.property.properties.FloatProperty;
+import myau.property.properties.PercentProperty;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.network.play.client.C02PacketUseEntity.Action;
@@ -20,14 +21,31 @@ public class Wtap extends Module {
     private boolean stopForward = false;
     private long delayTicks = 0L;
     private long durationTicks = 0L;
+    private int chanceAccumulator = 0;
     public final FloatProperty delay = new FloatProperty("delay", 5.5F, 0.0F, 10.0F);
     public final FloatProperty duration = new FloatProperty("duration", 1.5F, 1.0F, 5.0F);
+    public final PercentProperty chance = new PercentProperty("chance", 100);
 
+    /**
+     * Whether the current sprint state still supports continuing a W-tap.
+     * Ported from the upstream {@code canContinueWTap}: sneaking keeps the tap alive,
+     * whereas blindness or item use aborts it.
+     */
     private boolean canTrigger() {
-        return !(mc.thePlayer.movementInput.moveForward < 0.8F)
-                && !mc.thePlayer.isCollidedHorizontally
-                && (!((float) mc.thePlayer.getFoodStats().getFoodLevel() <= 6.0F) || mc.thePlayer.capabilities.allowFlying) && (mc.thePlayer.isSprinting()
-                || !mc.thePlayer.isUsingItem() && !mc.thePlayer.isPotionActive(Potion.blindness) && mc.gameSettings.keyBindSprint.isKeyDown());
+        if (mc.thePlayer.movementInput.moveForward < 0.8F || mc.thePlayer.isCollidedHorizontally) {
+            return false;
+        }
+        if ((float) mc.thePlayer.getFoodStats().getFoodLevel() <= 6.0F
+                && !mc.thePlayer.capabilities.allowFlying) {
+            return false;
+        }
+        if (mc.thePlayer.isSneaking()) {
+            return true;
+        }
+        if (mc.thePlayer.isUsingItem() || mc.thePlayer.isPotionActive(Potion.blindness)) {
+            return false;
+        }
+        return mc.gameSettings.keyBindSprint.isKeyDown();
     }
 
     public Wtap() {
@@ -69,6 +87,12 @@ public class Wtap extends Module {
                     && this.timer.hasTimeElapsed(500L)
                     && mc.thePlayer.isSprinting()) {
                 this.timer.reset();
+                // Accumulate the configured chance so sub-100 values are honoured
+                // proportionally over many attacks rather than at random per hit.
+                this.chanceAccumulator = this.chanceAccumulator % 100 + this.chance.getValue();
+                if (this.chanceAccumulator < 100) {
+                    return;
+                }
                 this.active = true;
                 this.stopForward = false;
                 this.delayTicks = this.delayTicks + (long) (50.0F * this.delay.getValue());

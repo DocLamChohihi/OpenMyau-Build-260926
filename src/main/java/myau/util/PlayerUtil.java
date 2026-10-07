@@ -139,6 +139,178 @@ public class PlayerUtil {
         return blockPos.distanceSqToCenter(x, y, z) < Math.pow(reach, 2.0);
     }
 
+    // ------------------------------------------------------------------
+    // Ported from the Myau-250910 rewrite (KillAura / Scaffold / NoFall / Eagle).
+    // Upstream renamed these helpers; note the semantic differences from the
+    // older canFly()/isAirBelow() pair above.
+    // ------------------------------------------------------------------
+
+    /** True when the game is not paused by a screen and the attack key is held. */
+    public static boolean isAttackKeyDown() {
+        return PlayerUtil.mc.currentScreen == null
+                && KeyBindUtil.isKeyDown(PlayerUtil.mc.gameSettings.keyBindAttack.getKeyCode());
+    }
+
+    /** True when the game is not paused by a screen and the use-item key is held. */
+    public static boolean isUseItemKeyDown() {
+        return PlayerUtil.mc.currentScreen == null
+                && KeyBindUtil.isKeyDown(PlayerUtil.mc.gameSettings.keyBindUseItem.getKeyCode());
+    }
+
+    /** True when the game is not paused by a screen and the sneak key is held. */
+    public static boolean isSneakKeyDown() {
+        return PlayerUtil.mc.currentScreen == null
+                && KeyBindUtil.isKeyDown(PlayerUtil.mc.gameSettings.keyBindSneak.getKeyCode());
+    }
+
+    /**
+     * True when the projected fall distance exceeds the safe threshold.
+     * Equivalent to the upstream {@code PlayerUtils.wouldTakeFallDamage}.
+     */
+    public static boolean wouldTakeFallDamage(float safeFallDistance) {
+        if (PlayerUtil.mc.thePlayer.capabilities.allowFlying || PlayerUtil.mc.thePlayer.capabilities.disableDamage) {
+            return false;
+        }
+        PotionEffect jumpEffect = PlayerUtil.mc.thePlayer.getActivePotionEffect(Potion.jump);
+        float jumpBoost = jumpEffect != null ? (float) (jumpEffect.getAmplifier() + 1) : 0.0f;
+        float projectedFallDistance = PlayerUtil.mc.thePlayer.fallDistance;
+        if (PlayerUtil.mc.thePlayer.motionY < -0.67 || !PlayerUtil.hasCollisionBelow()) {
+            projectedFallDistance -= (float) PlayerUtil.mc.thePlayer.motionY;
+        }
+        return MathHelper.ceiling_float_int(projectedFallDistance - safeFallDistance - jumpBoost) > 0;
+    }
+
+    /**
+     * True when every block straight below the player down to {@code depth} is air.
+     * This is the upstream {@code isAirBelow(int)}; it returns the *opposite* polarity
+     * of {@link #canFly(int)}, which returns false as soon as solid ground is found.
+     */
+    public static boolean isAirBelow(int depth) {
+        if (PlayerUtil.mc.thePlayer.capabilities.allowFlying || PlayerUtil.mc.thePlayer.capabilities.disableDamage) {
+            return false;
+        }
+        int playerY = MathHelper.floor_double(PlayerUtil.mc.thePlayer.posY);
+        for (int offset = 0; offset <= depth; ++offset) {
+            int y = playerY - offset;
+            if (y < 0) {
+                break;
+            }
+            Block block = PlayerUtil.mc.theWorld
+                    .getBlockState(new BlockPos(PlayerUtil.mc.thePlayer.posX, y, PlayerUtil.mc.thePlayer.posZ))
+                    .getBlock();
+            if (!(block instanceof BlockAir)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** True when the given box sits entirely over a void column. */
+    public static boolean isBoundsOverVoid(AxisAlignedBB boundingBox) {        if (PlayerUtil.mc.thePlayer.isInWater() || PlayerUtil.mc.thePlayer.isInLava()) {
+            return false;
+        }
+        int startY = MathHelper.floor_double(boundingBox.minY);
+        if (startY < 0) {
+            return true;
+        }
+        int minX = MathHelper.floor_double(boundingBox.minX);
+        int maxX = MathHelper.floor_double(boundingBox.maxX + 1.0);
+        int minZ = MathHelper.floor_double(boundingBox.minZ);
+        int maxZ = MathHelper.floor_double(boundingBox.maxZ + 1.0);
+        for (int x = minX; x < maxX; ++x) {
+            for (int z = minZ; z < maxZ; ++z) {
+                for (int y = startY; y >= 0; --y) {
+                    if (!BlockUtil.isReplaceable(new BlockPos(x, y, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /** True when the player's own box sits entirely over a void column. */
+    public static boolean isOverVoid() {
+        return PlayerUtil.isBoundsOverVoid(
+                PlayerUtil.mc.thePlayer.getEntityBoundingBox().expand(-1.0E-6, 0.0, -1.0E-6));
+    }
+
+    /** True when the player's box offset by the given vector is free of collisions. */
+    public static boolean isOffsetCollisionFree(double offsetX, double offsetY, double offsetZ) {
+        AxisAlignedBB boundingBox = PlayerUtil.mc.thePlayer.getEntityBoundingBox().offset(offsetX, offsetY, offsetZ);
+        return PlayerUtil.mc.theWorld.getCollidingBoundingBoxes(PlayerUtil.mc.thePlayer, boundingBox).isEmpty();
+    }
+
+    /**
+     * Like {@link #isOffsetCollisionFree} but narrows the box along X/Z by
+     * {@code widthFactor} first, matching the upstream Eagle edge test.
+     */
+    public static boolean isNarrowOffsetCollisionFree(double offsetX, double offsetY, double offsetZ, float widthFactor) {
+        double horizontalInset = PlayerUtil.mc.thePlayer.width / -2.0F * (1.0F - widthFactor);
+        AxisAlignedBB boundingBox = PlayerUtil.mc.thePlayer.getEntityBoundingBox()
+                .offset(offsetX, offsetY, offsetZ)
+                .expand(horizontalInset, 0.0, horizontalInset);
+        return PlayerUtil.mc.theWorld.getCollidingBoundingBoxes(PlayerUtil.mc.thePlayer, boundingBox).isEmpty();
+    }
+
+    /** True when there is a collision one block below the player. */
+    public static boolean hasCollisionBelow() {
+        AxisAlignedBB axisAlignedBB = PlayerUtil.mc.thePlayer.getEntityBoundingBox().offset(0.0, -1.0, 0.0);
+        return !PlayerUtil.mc.theWorld.getCollidingBoundingBoxes(PlayerUtil.mc.thePlayer, axisAlignedBB).isEmpty();
+    }
+
+    /** True when there is a collision one block above the player. */
+    public static boolean hasCollisionAbove() {
+        AxisAlignedBB axisAlignedBB = PlayerUtil.mc.thePlayer.getEntityBoundingBox().offset(0.0, 1.0, 0.0);
+        return !PlayerUtil.mc.theWorld.getCollidingBoundingBoxes(PlayerUtil.mc.thePlayer, axisAlignedBB).isEmpty();
+    }
+
+    /** Estimate the damage the player's held item would deal to the target. */
+    public static float estimateAttackDamage(Entity target) {
+        float baseDamage = (float) PlayerUtil.mc.thePlayer
+                .getEntityAttribute(SharedMonsterAttributes.attackDamage)
+                .getAttributeValue();
+        if (target instanceof EntityLivingBase) {
+            baseDamage += EnchantmentHelper.getModifierForCreature(
+                    PlayerUtil.mc.thePlayer.getHeldItem(), ((EntityLivingBase) target).getCreatureAttribute());
+        }
+        if (PlayerUtil.mc.thePlayer.fallDistance > 0.0F
+                && !PlayerUtil.mc.thePlayer.onGround
+                && !PlayerUtil.mc.thePlayer.isOnLadder()
+                && !PlayerUtil.mc.thePlayer.isInWater()
+                && !PlayerUtil.mc.thePlayer.isPotionActive(Potion.blindness)
+                && PlayerUtil.mc.thePlayer.ridingEntity == null
+                && baseDamage > 0.0F) {
+            baseDamage *= 1.5F;
+        }
+        return baseDamage;
+    }
+
+    /** Length of the swing animation in ticks, adjusted for haste/mining fatigue. */
+    public static int swingDuration() {
+        if (PlayerUtil.mc.thePlayer.isPotionActive(Potion.digSpeed)) {
+            return 6 - (1 + PlayerUtil.mc.thePlayer.getActivePotionEffect(Potion.digSpeed).getAmplifier());
+        }
+        if (PlayerUtil.mc.thePlayer.isPotionActive(Potion.digSlowdown)) {
+            return 6 + (1 + PlayerUtil.mc.thePlayer.getActivePotionEffect(Potion.digSlowdown).getAmplifier()) * 2;
+        }
+        return 6;
+    }
+
+    /**
+     * Plays only the local swing animation, without sending anything to the server.
+     * Used by HitSelect to preserve the appearance of an attack it withholds.
+     */
+    public static void swingLocally() {
+        if (PlayerUtil.mc.thePlayer.isSwingInProgress
+                && PlayerUtil.mc.thePlayer.swingProgressInt < PlayerUtil.swingDuration() / 2
+                && PlayerUtil.mc.thePlayer.swingProgressInt >= 0) {
+            return;
+        }
+        PlayerUtil.mc.thePlayer.swingProgressInt = -1;
+        PlayerUtil.mc.thePlayer.isSwingInProgress = true;
+    }
+
     public static void attackEntity(Entity target) {
         if (ForgeHooks.onPlayerAttackTarget(mc.thePlayer, target)) {
             if (target.canAttackWithItem() && !target.hitByEntity(mc.thePlayer)) {

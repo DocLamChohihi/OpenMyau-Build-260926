@@ -78,6 +78,12 @@ public class NoSlow extends Module {
     @EventTarget
     public void onLivingUpdate(LivingUpdateEvent event) {
         if (this.isEnabled() && this.isAnyActive()) {
+            // KillAura's auto-block-no-slow already handles the item slowdown for us;
+            // applying it again here would double-scale movement.
+            KillAura killAura = (KillAura) Myau.moduleManager.modules.get(KillAura.class);
+            if (killAura.isAutoBlockActive() && killAura.autoBlockNoSlow.getValue()) {
+                return;
+            }
             float multiplier = (float) this.getMotionMultiplier() / 100.0F;
             mc.thePlayer.movementInput.moveForward *= multiplier;
             mc.thePlayer.movementInput.moveStrafe *= multiplier;

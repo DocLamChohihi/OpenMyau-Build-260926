@@ -8,6 +8,7 @@ import myau.events.PacketEvent;
 import myau.events.UpdateEvent;
 import myau.module.Module;
 import myau.property.properties.ModeProperty;
+import myau.util.PlayerUtil;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
@@ -27,6 +28,10 @@ public class HitSelect extends Module {
     
     private int blockedHits = 0;
     private int allowedHits = 0;
+    private final java.util.Map<EntityLivingBase, Integer> remainingHurtTicks = new java.util.HashMap<>();
+    private final java.util.Map<EntityLivingBase, Float> previousAttackDamage = new java.util.HashMap<>();
+    public final myau.property.properties.IntProperty hurtTime = new myau.property.properties.IntProperty("hurt-time", 4, 0, 10);
+    public final myau.property.properties.BooleanProperty swing = new myau.property.properties.BooleanProperty("swing", true);
 
     public HitSelect() {
         super("HitSelect", false);
@@ -40,6 +45,12 @@ public class HitSelect extends Module {
         
         if (event.getType() == EventType.POST) {
             this.resetMotion();
+            for (EntityLivingBase entity : this.remainingHurtTicks.keySet()) {
+                Integer remaining = this.remainingHurtTicks.get(entity);
+                if (remaining != null && remaining > 0) {
+                    this.remainingHurtTicks.put(entity, remaining - 1);
+                }
+            }
         }
     }
 
@@ -227,6 +238,48 @@ public class HitSelect extends Module {
         this.savedSlowdown = 0.0;
     }
 
+    /**
+     * Upstream HitSelect behaviour used by KillAura: withhold the attack while the target
+     * still has hurt ticks left, the previous hit was stronger, and the player is sprinting.
+     * Ported from the Myau-250910 rewrite; the local {@code mode} handling above is untouched.
+     */
+    public boolean shouldDelayAttack(EntityLivingBase target) {
+        if (target == null) {
+            return false;
+        }
+
+        float attackDamage = PlayerUtil.estimateAttackDamage(target);
+        int remaining = this.remainingHurtTicks.getOrDefault(target, 0);
+        if (remaining <= 0) {
+            this.remainingHurtTicks.put(target, target.hurtTime);
+            this.previousAttackDamage.put(target, attackDamage);
+            return false;
+        }
+
+        remaining = this.remainingHurtTicks.getOrDefault(target, 0);
+        if (remaining <= this.hurtTime.getValue()) {
+            return false;
+        }
+        if (this.previousAttackDamage.getOrDefault(target, 0.0F) > attackDamage) {
+            this.previousAttackDamage.put(target, attackDamage);
+            return false;
+        }
+        if (KillSelectCompat.hurtTimeRemaining(mc.thePlayer) <= 0 && mc.thePlayer.isSprinting()) {
+            if (this.swing.getValue()) {
+                PlayerUtil.swingLocally();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** Local shim for the upstream {@code PlayerUtils.estimateAttackDamage} name. */
+    private static final class KillSelectCompat {
+        private static int hurtTimeRemaining(net.minecraft.client.entity.EntityPlayerSP player) {
+            return player.hurtTime;
+        }
+    }
+
     private boolean isMovingTowards(EntityLivingBase source, EntityLivingBase target, double maxAngle) {
         Vec3 currentPos = source.getPositionVector();
         Vec3 lastPos = new Vec3(source.lastTickPosX, source.lastTickPosY, source.lastTickPosZ);
@@ -275,6 +328,8 @@ public class HitSelect extends Module {
         this.savedSlowdown = 0.0;
         this.blockedHits = 0;
         this.allowedHits = 0;
+        this.remainingHurtTicks.clear();
+        this.previousAttackDamage.clear();
     }
 
     @Override

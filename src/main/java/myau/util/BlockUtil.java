@@ -38,7 +38,19 @@ public class BlockUtil {
         if (block instanceof BlockFence) return true;
         if (block instanceof BlockButton) return true;
         if (block instanceof BlockLever) return true;
-        return block instanceof BlockJukebox;
+        if (block instanceof BlockJukebox) return true;
+        // Added upstream: note blocks are right-clickable and must not be treated as
+        // placement support or counted as scaffold blocks.
+        return block instanceof BlockNote;
+    }
+
+    /**
+     * True for blocks that behave as ordinary full placement cubes. Upstream renamed
+     * {@link #isSolid} to {@code isSuitableFullBlock} and reuses it for Scaffold's
+     * block counter, so the two are kept consistent here.
+     */
+    public static boolean isSuitableFullBlock(Block block) {
+        return BlockUtil.isSolid(block);
     }
 
     public static boolean isSolid(Block block) {
