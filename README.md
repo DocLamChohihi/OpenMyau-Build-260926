@@ -4,8 +4,6 @@
 
 Based on **`Myau-260926`**, with added features and improvements not found in the original, focused on expanding and refining the original Myau client.
 
-[![Discord](https://invidget.switchblade.xyz/yjSaTufmqU)](https://discord.gg/zv2AwJT93s)
-
 ## Changes
 
 ### Upstream sync `250910` → `260926`
